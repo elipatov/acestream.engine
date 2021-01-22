@@ -1,0 +1,12 @@
+[Unit]
+Description=Ace Stream Media Service
+After = remote-fs.target network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/acestream/acestream.start
+ExecStop=/opt/acestream/acestream.stop
+Restart=on-abort
+
+[Install]
+WantedBy=multi-user.target

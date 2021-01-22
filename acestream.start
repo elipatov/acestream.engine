@@ -1,0 +1,36 @@
+#!/bin/bash
+PATH=/sbin:/bin:/usr/sbin:/usr/bin
+
+ACEADDON=$(readlink -f $(dirname $0))
+ACECHROOT="androidfs"
+
+if mount | grep -E "( $ACEADDON/$ACECHROOT/proc | $ACEADDON/$ACECHROOT/sys | $ACEADDON/$ACECHROOT/dev )" >/dev/null; then
+  if [ $? -eq 0 ]; then
+   pkill -9 -f "/acestream.engine/python/bin/python" &>/dev/null
+   pkill -9 -f "/system/bin/acestream.sh" &>/dev/null
+   #unmount directories
+   umount $ACEADDON/$ACECHROOT/dev &>/dev/null
+   umount $ACEADDON/$ACECHROOT/proc &>/dev/null
+   umount $ACEADDON/$ACECHROOT/sys &>/dev/null
+  fi
+fi
+
+mkdir -p $ACEADDON/$ACECHROOT/system
+mkdir -p $ACEADDON/$ACECHROOT/system/etc
+mkdir -p $ACEADDON/$ACECHROOT/dev
+mkdir -p $ACEADDON/$ACECHROOT/proc
+mkdir -p $ACEADDON/$ACECHROOT/sys
+
+[ ! -f $ACEADDON/$ACECHROOT/system/etc/resolv.conf ] && cp -L /etc/resolv.conf $ACEADDON/$ACECHROOT/system/etc/resolv.conf
+[ ! -f $ACEADDON/$ACECHROOT/system/etc/hosts ] && cp -L /etc/hosts $ACEADDON/$ACECHROOT/system/etc/hosts
+
+mount -o bind /dev $ACEADDON/$ACECHROOT/dev &>/dev/null
+mount -t proc proc $ACEADDON/$ACECHROOT/proc &>/dev/null
+mount -t sysfs sysfs $ACEADDON/$ACECHROOT/sys &>/dev/null
+
+chown -R root:root $ACEADDON/$ACECHROOT/system
+find $ACEADDON/$ACECHROOT/system -type d -exec chmod 755 {} \;
+find $ACEADDON/$ACECHROOT/system -type f -exec chmod 644 {} \;
+chmod 755 $ACEADDON/$ACECHROOT/system/bin/* $ACEADDON/$ACECHROOT/acestream.engine/python/bin/python
+
+chroot $ACEADDON/$ACECHROOT /system/bin/busybox sh -c "/system/bin/acestream.sh" > $ACEADDON/acestream.log 2>&1

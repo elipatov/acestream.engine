@@ -115,6 +115,7 @@ function add_external_playlist()
             $("#add-external-playlist-http-login").val("");
             $("#add-external-playlist-http-password").val("");
             reload_external_playlists();
+            reload_epg_sources();
             if(mode == "add") {
                 show_page("proxy-server-playlist");
             }
@@ -143,7 +144,7 @@ function edit_external_playlist(playlist_id)
             $("#add-external-playlist-http-login").val(response.login);
             $("#add-external-playlist-http-password").val(response.password);
             $("#add-external-playlist-category option[value='"+response.category+"']").prop('selected', true);
-            $("#add-external-playlist-update-interval option[value='"+response.interval+"']").prop('selected', true);
+            $("#add-external-playlist-update-interval option[value='"+response.update_interval+"']").prop('selected', true);
 
             show_page("media-server-edit-playlist", {
                 params: {
@@ -163,7 +164,8 @@ function edit_external_playlist(playlist_id)
 function playlist_add_item_form_submit()
 {
     var file = $("#playlist-add-item-file").val() || "";
-    if(file.length == 0) {
+    var logoFile = $("#playlist-add-item-logo-file").val() || "";
+    if(file.length == 0 && logoFile.length == 0) {
         // send ajax request
         add_playlist_item();
     }
@@ -188,6 +190,7 @@ function add_playlist_item2(details)
             auto_search: details.auto_search,
             hls_manifest_url: details.hls_manifest_url,
             video_url: details.video_url,
+            poster: details.poster,
             },
             // onsuccess
             function(response) {
@@ -209,6 +212,7 @@ function add_playlist_item(onsuccess)
 {
     var title = $("#playlist-add-item-title").val(),
         hls_manifest_url = $("#playlist-add-item-hls-manifest-url").val(),
+        logo_url = $("#playlist-add-item-logo-url").val(),
         video_url = $("#playlist-add-item-video-url").val();
 
     var details = {
@@ -221,6 +225,7 @@ function add_playlist_item(onsuccess)
         auto_search: false,
         hls_manifest_url: hls_manifest_url,
         video_url: video_url,
+        poster: logo_url,
         onsuccess: function() {
             $("#playlist-add-item-content-id").val("");
             $("#playlist-add-item-infohash").val("");
@@ -229,6 +234,7 @@ function add_playlist_item(onsuccess)
             $("#playlist-add-item-transport-file-url").val("");
             $("#playlist-add-item-hls-manifest-url").val("");
             $("#playlist-add-item-video-url").val("");
+            $("#playlist-add-item-logo-url").val("");
             reload_playlist();
             show_page("proxy-server-playlist");
             if(typeof onsuccess === 'function') {
@@ -654,9 +660,6 @@ function update_playlist_item_row(playlist_item) {
     if(playlist_item.icons && playlist_item.icons.length) {
         iconHtml = '<img src="'+playlist_item.icons[0].url+'" />';
     }
-    else if(playlist_item.poster) {
-        iconHtml = '<img src="/server/api?method=get_image&url='+encodeURIComponent(playlist_item.poster)+'" />';
-    }
 
     if(iconHtml) {
         $root.find('.playlist-item-row-icon').html(iconHtml);
@@ -693,9 +696,12 @@ function update_playlist_item_row(playlist_item) {
     // debug info
     var debugInfoHtml = '';
     if(params.debug_webui_client) {
+        debugInfoHtml += '<div>id: ' + playlist_item.id + '</div>';
         debugInfoHtml += '<div>infohash: ' + playlist_item.infohash + '</div>';
+        debugInfoHtml += '<div>url: ' + playlist_item.url + '</div>';
         debugInfoHtml += '<div>cid: ' + playlist_item.content_id + '</div>';
         debugInfoHtml += '<div>hash: ' + playlist_item.hash + '</div>';
+        debugInfoHtml += '<div>hash_v2: ' + playlist_item.hash_v2 + '</div>';
         debugInfoHtml += '<div>ctype: ' + playlist_item.content_type + '</div>';
         debugInfoHtml += '<div>is_live: ' + playlist_item.is_live + '</div>';
         debugInfoHtml += '<div>created at: ' + moment.unix(playlist_item.created_at).format("YYYY-MM-DD HH:mm") + '</div>';
@@ -732,11 +738,6 @@ function render_playlist_item_row(playlist_item)
             html += playlist_item.tags[i];
         }
     }
-    else if(playlist_item.categories && playlist_item.categories.length) {
-        // categories from EPG database
-        html += '<br/>';
-        html += playlist_item.categories.join(" / ");
-    }
     html += '</td>';
 
     // icon/description
@@ -746,9 +747,6 @@ function render_playlist_item_row(playlist_item)
     if(playlist_item.icons && playlist_item.icons.length) {
         html += '<img src="'+playlist_item.icons[0].url+'" />';
     }
-    else if(playlist_item.poster) {
-        html += '<img src="/server/api?method=get_image&url='+encodeURIComponent(playlist_item.poster)+'" />';
-    }
     html += '</td>';
 
     html += '<td width="95%">';
@@ -757,9 +755,12 @@ function render_playlist_item_row(playlist_item)
     // show infohash/content_id in debug mode
     if(params.debug_webui_client) {
         html += '<div class="playlist-item-row-debug-info">';
+        html += '<div>id: ' + playlist_item.id + '</div>';
         html += '<div>infohash: ' + playlist_item.infohash + '</div>';
+        html += '<div>url: ' + playlist_item.url + '</div>';
         html += '<div>cid: ' + playlist_item.content_id + '</div>';
         html += '<div>hash: ' + playlist_item.hash + '</div>';
+        html += '<div>hash_v2: ' + playlist_item.hash_v2 + '</div>';
         html += '<div>ctype: ' + playlist_item.content_type + '</div>';
         html += '<div>is_live: ' + playlist_item.is_live + '</div>';
         html += '<div>created at: ' + moment.unix(playlist_item.created_at).format("YYYY-MM-DD HH:mm") + '</div>';
@@ -770,6 +771,7 @@ function render_playlist_item_row(playlist_item)
         html += '</div>';
     }
 
+    html += '<div class="playlist-item-row-epg-info">';
     if(playlist_item.epg && playlist_item.epg.length) {
         var now = moment();
         var start = moment.unix(playlist_item.epg[0].start);
@@ -779,15 +781,14 @@ function render_playlist_item_row(playlist_item)
         var totalSeconds = playlist_item.epg[0].stop - playlist_item.epg[0].start;
         var playedPercent = Math.round(secondsPlayed / totalSeconds * 100);
 
-        html += '<div class="playlist-item-row-epg-info">';
         html += start.format("HH:mm") + " - ";
         html += stop.format("HH:mm") + " ";
         html += playlist_item.epg[0].title;
         html += '<div style="position: relative; width: 200px; height: 10px; background-color: #ccc;">';
         html += '<div style="position: absolute; left: 0; top: 0; width: '+playedPercent+'%; height: 100%; background-color: #80AFCA;"></div>';
         html += '</div>';
-        html += '</div>';
     }
+    html += '</div>';
     html += '</td>'
 
     // favorite button
@@ -1200,6 +1201,7 @@ function delete_external_playlist(playlist_id)
                 reload_playlist();
                 reload_playlist_trash();
                 reload_broadcast_list();
+                reload_epg_sources();
             }
         );
     return true;
@@ -1373,7 +1375,7 @@ function get_lang_name(lang) {
     }
     else {
         if(languageNames[lang] !== undefined) {
-            return languageNames[lang].native + " (" + languageNames[lang].name + ")";
+            return languageNames[lang].name + " (" + languageNames[lang].native + ")";
         }
         else {
             return lang;

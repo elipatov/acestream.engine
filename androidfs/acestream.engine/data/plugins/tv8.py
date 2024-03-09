@@ -1,44 +1,47 @@
-#-plugin-sig:O1sWOvLnrTMOmJmvkP8hg5L3hzYXsbhXA/THNFunjwPUI7nvPrCEHW+Ax3xPG1tp7ZdDLboudjdolTtefr92+GOYK12IIfU/pwGerXkwvQNpiter0i63qhbMOi3xgdxXtbHzwX8FJoXxfWYwNGy59sNEAMuEkmz/GogqJThjNv6wxQWTv9eOzJmU/XkAUR7KRwMlYzkNa0b8Y4PX65X6ZqiciNSEV1uG00d/yMMYntSnbRi0og/oTKRRblqJtHs5QmnfSW1tPUVRKIH82i/iKjOJbAiZ0CIgIaFkPp/4FqeAwUECQnir1yPFYI5tV3EguPigiZY0i8C0zGR+P33qyg==
-from __future__ import print_function
+#-plugin-sig:Yn1yMn9Q0wxQOcuTjrz5SGjkdqu+Ah/w/Inc1hC8+amf43doL+RR5F/hAzF0ExG89oj+bErIkFaQgzLCeLD+Qw+wYwyO4odTpGlOjApnU//rd7+vsvoDGOHuJrwrNoQVplrKH7dHyBTEZAC+FRcTjZDRMXwkZc4VTOGGI9JVLVyissvpGDHMo+pzJzPxrgsknZaBL3L9b+/KpOEiaNCxl6v0RiNd48bSlb1LD29U1W29SDCSvl6tnXNeMXShyS0uAgivoVPbZDJD1+YrvwXJLnIJWrOakmSyoZTUeYJtrevShQ2D/v8MqpdHOJmxa86XfKJXJy5soCJxs3IOg559KQ==
+"""
+$description Turkish live TV channel owned by Acun Medya Group.
+$url tv8.com.tr
+$type live
+"""
+
+import logging
 import re
 
-from ACEStream.PluginsContainer.livestreamer.plugin import Plugin
-from ACEStream.PluginsContainer.livestreamer.plugin.api import http
-from ACEStream.PluginsContainer.livestreamer.plugin.api import validate
-from ACEStream.PluginsContainer.livestreamer.stream import HLSStream
+from streamlink.plugin import Plugin, pluginmatcher
+from streamlink.plugin.api import validate
+from streamlink.stream.hls import HLSStream, HLSStreamReader, HLSStreamWriter
 
 
+log = logging.getLogger(__name__)
+
+
+class TV8HLSStreamWriter(HLSStreamWriter):
+    ad_re = re.compile(r"/ad/|/crea/")
+
+    def should_filter_sequence(self, sequence):
+        return self.ad_re.search(sequence.segment.uri) is not None or super().should_filter_sequence(sequence)
+
+
+class TV8HLSStreamReader(HLSStreamReader):
+    __writer__ = TV8HLSStreamWriter
+
+
+class TV8HLSStream(HLSStream):
+    __reader__ = TV8HLSStreamReader
+
+
+@pluginmatcher(re.compile(
+    r"https?://www\.tv8\.com\.tr/canli-yayin",
+))
 class TV8(Plugin):
-    """
-    Support for the live stream on www.tv8.com.tr
-    """
-    url_re = re.compile(r"https?://www.tv8.com.tr/canli-yayin")
-
-    player_config_re = re.compile(r"""
-        configPlayer.source.media.push[ ]*\(
-        [ ]*\{[ ]*'src':[ ]*"(.*?)",
-        [ ]*type:[ ]*"application/x-mpegURL"[ ]*}[ ]*\);
-    """, re.VERBOSE)
-    player_config_schema = validate.Schema(
-        validate.transform(player_config_re.search),
-        validate.any(
-            None,
-            validate.all(
-                validate.get(1),
-                validate.url()
-            )
-        )
-    )
-
-    @classmethod
-    def can_handle_url(cls, url):
-        return cls.url_re.match(url) is not None
-
     def _get_streams(self):
-        res = http.get(self.url)
-        stream_url = self.player_config_schema.validate(res.text)
-        if stream_url:
-            return HLSStream.parse_variant_playlist(self.session, stream_url)
+        hls_url = self.session.http.get(self.url, schema=validate.Schema(
+            re.compile(r"""var\s+videoUrl\s*=\s*(?P<q>["'])(?P<hls_url>https?://.*?\.m3u8.*?)(?P=q)"""),
+            validate.any(None, validate.get("hls_url")),
+        ))
+        if hls_url is not None:
+            return TV8HLSStream.parse_variant_playlist(self.session, hls_url)
 
 
 __plugin__ = TV8

@@ -278,4 +278,13 @@ _LANG['ru_RU'] = {
     'select-one-of-these-variants': 'Выберите один из вариантов',
     'login': 'Логин',
     'password': 'Пароль',
+    'channel-logos': 'Логотипы каналов',
+    'uploaded-logos': 'Загруженные логотипы',
+    'upload-channel-logos-zip': 'Загрузить логотипы каналов (.zip)',
+    'remove-all': 'Удалить все',
+    'remove-all-logos': 'Удалить все логотипы',
+    'confirm-remove-all-logos': 'Все логотипы будут удалены. Вы уверены?',
+    'add-custom-logo': 'Добавить пользовательский логотип',
+    'logo-url': 'URL логотипа',
+    'select-logo-file': 'Выбрать файл логотипа',
 };

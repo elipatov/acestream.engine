@@ -1,54 +1,68 @@
-#-plugin-sig:RQOy/WJl6UqZ8CYhuFEDhH7M0IazAxQdk163P5Ku5IKEZcjaNJ4OoBY5MEcYHTtSF7JflRBmSKJQ2QB1pF7mX0DvguyvB4sGHHu7XrKoAKgn4hLABp/3BpddNoQfjIIr4geWMjUfEETLkul6DY6Kdn48bah/euZCJ0Ka3yTpcDK3olUJpq5PB2gd5pBj4qr0zhr9F2hprciDfTUVVUaWF4/HtSC8lm+ujILGtCauZap3LxVOT83acq0+6iFGpZXnYqOar/0dCS2L3Lq2o/RSK41GMuC3N18GhbNqworU1XVKdzmfiPAuUhpdPqhA6S1JJywgV41E0rGkm+WTRgP+nw==
-from __future__ import print_function
+#-plugin-sig:UDwRoUO2sPXOZetEq7GxiXWmXAQSUZPipNMunoedUo9vf3T8Lpd9O9YZw2wX2V/jPHAJo0a6Vf7H42plITaVk9RNVwqVnxTVu8lZzYtlCjsv5iRQjYKzxEnnOKenGHATrO9f51OpMlI+9Mkb7xrojFFUpDJgn5D9fsfpX+zhWdWlAkTkHhPusW7n4ZcqYDXU/6M5nt0jyMnRUrG2Mh+j4gTM2Doz/pVtHlLFvZsQCNJPrKAwOVhiIKnbKBB1yobINWJ1wYEAzLgdNA/Yza7Aizygse7doyMXkm2rV7tAEQc998RKTwQndN1b74HUKkpYxTNVkKUt+rAauB8evZEGCw==
+"""
+$description Turkish live TV channels from Ciner Group, including Haberturk TV and Show TV.
+$url bloomberght.com
+$url haberturk.com
+$url haberturk.tv
+$url showmax.com.tr
+$url showturk.com.tr
+$url showtv.com.tr
+$type live
+"""
 
-import json
 import re
 
-from ACEStream.PluginsContainer.livestreamer.plugin import Plugin
-from ACEStream.PluginsContainer.livestreamer.plugin.api import http
-from ACEStream.PluginsContainer.livestreamer.plugin.api import validate
-from ACEStream.PluginsContainer.livestreamer.stream import HLSStream
-from ACEStream.PluginsContainer.livestreamer.compat import unquote
+from streamlink.plugin import Plugin, pluginmatcher
+from streamlink.plugin.api import validate
+from streamlink.stream.hls import HLSStream
 
 
+@pluginmatcher(re.compile(r"""
+    https?://(?:www\.)?
+    (?:
+        bloomberght\.com/tv
+        |
+        haberturk\.(?:com|tv)(?:/tv)?/canliyayin
+        |
+        showmax\.com\.tr/canli-?yayin
+        |
+        showturk\.com\.tr/canli-?yayin(?:/showtv)?
+        |
+        showtv\.com\.tr/canli-yayin(?:/showtv)?
+    )/?
+""", re.VERBOSE))
 class CinerGroup(Plugin):
-    """
-    Support for the live stream on www.showtv.com.tr
-    """
-    url_re = re.compile(r"""https?://(?:www.)?
-        (?:
-            showtv.com.tr/canli-yayin/showtv|
-            haberturk.com/canliyayin|
-            showmax.com.tr/canliyayin|
-            showturk.com.tr/canli-yayin/showturk|
-            bloomberght.com/tv|
-            haberturk.tv/canliyayin
-        )/?""", re.VERBOSE)
-    stream_re = re.compile(r"""div .*? data-ht=(?P<quote>["'])(?P<data>.*?)(?P=quote)""", re.DOTALL)
-    stream_data_schema = validate.Schema(
-        validate.transform(stream_re.search),
-        validate.any(
-            None,
-            validate.all(
-                validate.get("data"),
-                validate.transform(unquote),
-                validate.transform(lambda x: x.replace("&quot;", '"')),
-                validate.transform(json.loads),
-                {
-                    "ht_stream_m3u8": validate.url()
-                },
-                validate.get("ht_stream_m3u8")
-            )
+    @staticmethod
+    def _schema_videourl():
+        return validate.Schema(
+            validate.xml_xpath_string(".//script[contains(text(), 'videoUrl')]/text()"),
+            validate.none_or_all(
+                re.compile(r"""(?<!//)\s*var\s+videoUrl\s*=\s*(?P<q>['"])(?P<url>.+?)(?P=q)"""),
+                validate.none_or_all(
+                    validate.get("url"),
+                    validate.url(),
+                ),
+            ),
         )
-    )
 
-    @classmethod
-    def can_handle_url(cls, url):
-        return cls.url_re.match(url) is not None
+    @staticmethod
+    def _schema_data_ht():
+        return validate.Schema(
+            validate.xml_xpath_string(".//div[@data-ht][1]/@data-ht"),
+            validate.none_or_all(
+                validate.parse_json(),
+                {
+                    "ht_stream_m3u8": validate.url(),
+                },
+                validate.get("ht_stream_m3u8"),
+            ),
+        )
 
     def _get_streams(self):
-        res = http.get(self.url)
-        stream_url = self.stream_data_schema.validate(res.text)
+        root = self.session.http.get(self.url, schema=validate.Schema(validate.parse_html()))
+        schema_getters = self._schema_videourl, self._schema_data_ht
+        stream_url = next((res for res in (getter().validate(root) for getter in schema_getters) if res), None)
+
         if stream_url:
             return HLSStream.parse_variant_playlist(self.session, stream_url)
 

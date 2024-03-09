@@ -1,119 +1,225 @@
-#-plugin-sig:Hj5r6phJl8LO9IFHUhJms05apV+vDcjQY44Ya86BXGn5bw5rUsyS/6k2BosghbHjFLxwmAbUPoqzJrZCH/tHWBC0undnHc8xUrXpd//XBLiBvLyA7ZylJnM19gO/E+Ro3kGVPf2PyLN8wcALenx7uJe+Kb6DRngErinJhzDjSZF1D6pC1zEfdJ8bW53tzE+6tz2806bYzqbufjQWWsiX3D8pz/e4T2QYCZRN4Vdt9L+MvtmK8+KRNQ71zDkmc2E8DmL0Yr584Q8zZuxaF1uuDx8O3UJJ2nssXbeA0nSiHw19fs4jHjqC0PaJB5Ji8JqK+x6u6rxFH6/OBXo8JVFfGg==
+#-plugin-sig:GM0CodnSf5cHDeR5x5dmVVubEfpfk5laaqvGylQtNvVIBvZVeC7/GY/3HeuUF03aeyEv/tbWmXpnLukdS5w+Qy1ybGOp83CmrQTcBXKcHjixZ0p6qsHUoI+tCmEgu001HFKgjam3CAR4aW0HL4DzYlwi+ZBT+6BMNspMEN+ezPdsLlY00OnBLBL7AYDQ2Do3T6WIz6aZRY1AGiNKk9Jo5lbktS1SShcDo/u9SYJ5nMZgdyu5O4PUsg/iK3g1MoPhvZcpYmohKpKi2lCW+tOpnp8M1ou6A87jeNn2JIN03mTLEApykWH+FHqjxG6kIkuZBIeDt4UviRQqtZNPDoQThg==
+"""
+$description TV and live video game broadcasts, artist performances and personal daily-life video blogs & shows.
+$url play.afreecatv.com
+$type live
+"""
+
+import logging
 import re
 
-from ACEStream.PluginsContainer.livestreamer.plugin import Plugin
-from ACEStream.PluginsContainer.livestreamer.plugin.api import http, validate
-from ACEStream.PluginsContainer.livestreamer.stream import RTMPStream, HLSStream
-
-CHANNEL_INFO_URL = "http://live.afreecatv.com:8057/api/get_broad_state_list.php"
-KEEP_ALIVE_URL = "{server}/stream_keepalive.html"
-STREAM_INFO_URLS = {
-    "rtmp": "http://sessionmanager01.afreeca.tv:6060/broad_stream_assign.html",
-    "hls": "http://resourcemanager.afreeca.tv:9090/broad_stream_assign.html"
-}
-HLS_KEY_URL = "http://api.m.afreeca.com/broad/a/watch"
-
-CHANNEL_RESULT_ERROR = 0
-CHANNEL_RESULT_OK = 1
+from streamlink.plugin import Plugin, pluginargument, pluginmatcher
+from streamlink.plugin.api import validate
+from streamlink.stream.hls import HLSStream, HLSStreamReader, HLSStreamWriter
 
 
-_url_re = re.compile("http(s)?://(\w+\.)?afreeca(tv)?.com/(?P<username>\w+)(/\d+)?")
+log = logging.getLogger(__name__)
 
-_channel_schema = validate.Schema(
-    {
-        "CHANNEL": {
-            "RESULT": validate.transform(int),
-            "BROAD_INFOS": [{
-                "list": [{
-                    "nBroadNo": validate.text
-                }]
-            }]
-        }
-    },
-    validate.get("CHANNEL")
+
+class AfreecaHLSStreamWriter(HLSStreamWriter):
+    def should_filter_sequence(self, sequence):
+        return "preloading" in sequence.segment.uri or super().should_filter_sequence(sequence)
+
+
+class AfreecaHLSStreamReader(HLSStreamReader):
+    __writer__ = AfreecaHLSStreamWriter
+
+
+class AfreecaHLSStream(HLSStream):
+    __reader__ = AfreecaHLSStreamReader
+
+
+@pluginmatcher(re.compile(
+    r"https?://play\.afreecatv\.com/(?P<username>\w+)(?:/(?P<bno>:\d+))?",
+))
+@pluginargument(
+    "username",
+    sensitive=True,
+    requires=["password"],
+    metavar="USERNAME",
+    help="The username used to register with afreecatv.com.",
 )
-_stream_schema = validate.Schema(
-    {
-        validate.optional("view_url"): validate.url(
-            scheme=validate.any("rtmp", "http")
-        )
-    }
+@pluginargument(
+    "password",
+    sensitive=True,
+    metavar="PASSWORD",
+    help="A afreecatv.com account password to use with --afreeca-username.",
 )
-
-
+@pluginargument(
+    "purge-credentials",
+    action="store_true",
+    help="Purge cached AfreecaTV credentials to initiate a new session and reauthenticate.",
+)
 class AfreecaTV(Plugin):
+    _re_bno = re.compile(r"var nBroadNo = (?P<bno>\d+);")
+
+    CHANNEL_API_URL = "http://live.afreecatv.com/afreeca/player_live_api.php"
+    CHANNEL_RESULT_OK = 1
+    QUALITYS = ["original", "hd", "sd"]
+    QUALITY_WEIGHTS = {
+        "original": 1080,
+        "hd": 720,
+        "sd": 480,
+    }
+
+    _schema_channel = validate.Schema(
+        {
+            "CHANNEL": {
+                "RESULT": validate.transform(int),
+                validate.optional("BPWD"): str,
+                validate.optional("BNO"): str,
+                validate.optional("RMD"): str,
+                validate.optional("AID"): str,
+                validate.optional("CDN"): str,
+            },
+        },
+        validate.get("CHANNEL"),
+    )
+    _schema_stream = validate.Schema(
+        {
+            validate.optional("view_url"): validate.url(
+                scheme=validate.any("rtmp", "http"),
+            ),
+            "stream_status": str,
+        },
+    )
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._authed = (
+            self.session.http.cookies.get("PdboxBbs")
+            and self.session.http.cookies.get("PdboxSaveTicket")
+            and self.session.http.cookies.get("PdboxTicket")
+            and self.session.http.cookies.get("PdboxUser")
+            and self.session.http.cookies.get("RDB")
+        )
+
     @classmethod
-    def can_handle_url(self, url):
-        return _url_re.match(url)
+    def stream_weight(cls, key):
+        weight = cls.QUALITY_WEIGHTS.get(key)
+        if weight:
+            return weight, "afreeca"
 
-    def _get_channel_info(self, username):
-        headers = {
-            "Referer": self.url
-        }
-        params = {
-            "uid": username
-        }
-        res = http.get(CHANNEL_INFO_URL, params=params, headers=headers)
+        return Plugin.stream_weight(key)
 
-        return http.json(res, schema=_channel_schema)
-
-    def _get_hls_key(self, broadcast, username):
-        headers = {
-            "Referer": self.url
-        }
+    def _get_channel_info(self, broadcast, username):
         data = {
-            "bj_id": username,
-            "broad_no": broadcast
+            "bid": username,
+            "bno": broadcast,
+            "from_api": "0",
+            "mode": "landing",
+            "player_type": "html5",
+            "pwd": "",
+            "stream_type": "common",
+            "type": "live",
         }
-        res = http.post(HLS_KEY_URL, data=data, headers=headers)
+        res = self.session.http.post(self.CHANNEL_API_URL, data=data)
+        return self.session.http.json(res, schema=self._schema_channel)
 
-        return http.json(res)
+    def _get_hls_key(self, broadcast, username, quality):
+        data = {
+            "bid": username,
+            "bno": broadcast,
+            "from_api": "0",
+            "mode": "landing",
+            "player_type": "html5",
+            "pwd": "",
+            "quality": quality,
+            "stream_type": "common",
+            "type": "aid",
+        }
+        res = self.session.http.post(self.CHANNEL_API_URL, data=data)
+        return self.session.http.json(res, schema=self._schema_channel)
 
-    def _get_stream_info(self, broadcast, type):
+    def _get_stream_info(self, broadcast, quality, rmd):
         params = {
-            "return_type": "gs_cdn",
-            "use_cors": "true",
-            "cors_origin_url": "m.afreeca.com",
-            "broad_no": "{broadcast}-mobile-hd-{type}".format(**locals()),
-            "broad_key": "{broadcast}-flash-hd-{type}".format(**locals())
+            "return_type": "gs_cdn_pc_web",
+            "broad_key": f"{broadcast}-common-{quality}-hls",
         }
-        res = http.get(STREAM_INFO_URLS[type], params=params)
-        return http.json(res, schema=_stream_schema)
+        res = self.session.http.get(f"{rmd}/broad_stream_assign.html", params=params)
+        return self.session.http.json(res, schema=self._schema_stream)
 
-    def _get_hls_stream(self, broadcast, username):
-        keyjson = self._get_hls_key(broadcast, username)
-        if keyjson["result"] != CHANNEL_RESULT_OK:
+    def _get_hls_stream(self, broadcast, username, quality, rmd):
+        keyjson = self._get_hls_key(broadcast, username, quality)
+
+        if keyjson["RESULT"] != self.CHANNEL_RESULT_OK:
             return
-        key = keyjson["data"]["hls_authentication_key"]
-        info = self._get_stream_info(broadcast, "hls")
-        if "view_url" in info:
-            return HLSStream(self.session, info["view_url"], params=dict(aid=key))
+        key = keyjson["AID"]
 
-    def _get_rtmp_stream(self, broadcast):
-        info = self._get_stream_info(broadcast, "rtmp")
+        info = self._get_stream_info(broadcast, quality, rmd)
+
         if "view_url" in info:
-            params = dict(rtmp=info["view_url"])
-            return RTMPStream(self.session, params=params, redirect=True)
+            return AfreecaHLSStream(self.session, info["view_url"], params={"aid": key})
+
+    def _login(self, username, password):
+        data = {
+            "szWork": "login",
+            "szType": "json",
+            "szUid": username,
+            "szPassword": password,
+            "isSaveId": "true",
+            "isSavePw": "false",
+            "isSaveJoin": "false",
+            "isLoginRetain": "Y",
+        }
+        res = self.session.http.post("https://login.afreecatv.com/app/LoginAction.php", data=data)
+        data = self.session.http.json(res)
+        log.trace(f"{data!r}")
+        if data["RESULT"] != self.CHANNEL_RESULT_OK:
+            return False
+        self.save_cookies()
+        return True
 
     def _get_streams(self):
-        match = _url_re.match(self.url)
-        username = match.group("username")
+        login_username = self.get_option("username")
+        login_password = self.get_option("password")
 
-        channel = self._get_channel_info(username)
-        if channel["RESULT"] != CHANNEL_RESULT_OK:
+        self.session.http.headers.update({"Referer": self.url, "Origin": "http://play.afreecatv.com"})
+
+        if self.options.get("purge_credentials"):
+            self.clear_cookies()
+            self._authed = False
+            log.info("All credentials were successfully removed")
+
+        if self._authed:
+            log.debug("Attempting to authenticate using cached cookies")
+        elif login_username and login_password:
+            log.debug("Attempting to login using username and password")
+            if self._login(login_username, login_password):
+                log.info("Login was successful")
+            else:
+                log.error("Failed to login")
+
+        m = self.match.groupdict()
+        username = m["username"]
+        bno = m["bno"]
+        if bno is None:
+            res = self.session.http.get(self.url)
+            m = self._re_bno.search(res.text)
+            if not m:
+                log.error("Could not find broadcast number.")
+                return
+            bno = m.group("bno")
+
+        channel = self._get_channel_info(bno, username)
+        log.trace(f"{channel!r}")
+        if channel.get("BPWD") == "Y":
+            log.error("Stream is Password-Protected")
+            return
+        elif channel.get("RESULT") == -6:
+            log.error("Login required")
+            return
+        elif channel.get("RESULT") != self.CHANNEL_RESULT_OK:
             return
 
-        broadcast = channel["BROAD_INFOS"][0]["list"][0]["nBroadNo"]
-        if not broadcast:
+        (broadcast, rmd) = (channel["BNO"], channel["RMD"])
+        if not (broadcast and rmd):
             return
 
-        flash_stream = self._get_rtmp_stream(broadcast)
-        if flash_stream:
-            yield "live", flash_stream
-
-        mobile_stream = self._get_hls_stream(broadcast, username)
-        if mobile_stream:
-            yield "live", mobile_stream
+        for qkey in self.QUALITYS:
+            hls_stream = self._get_hls_stream(broadcast, username, qkey, rmd)
+            if hls_stream:
+                yield qkey, hls_stream
 
 
 __plugin__ = AfreecaTV

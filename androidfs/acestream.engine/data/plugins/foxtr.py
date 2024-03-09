@@ -1,29 +1,27 @@
-#-plugin-sig:HescUFYqgxyTs2M7oBvrZ4L35k8dV3ujNFOpGBPghtTDhNgXmcrSy91oZwgTtaRC5ORjrsN0BACLmI0ylEm7Qswjro1S4Z6rCezX8KMYB3c1LwDmNchg33JDTyozZ17T3esLyKeCUyFlKL3ZKxL4yxo9+8ntBhZ0NcDwHuvSjD6B1sfhBoay5z3ATZ/sbhV5Suz/WPP8XiRyGGCPrSR2C3mQ6fEv2k57UXmUFurs5nQHFg8FzJ2SN3OC450Q6qYsoB/uXlwp5k7aQlyoUK4hTAggXNdkCfn7uftYl03Y8S5eQGtR1wqkdN/loDyjgWvEHdCQ62nn/PJj1bt4iBQ0uA==
-from __future__ import print_function
+#-plugin-sig:jokRTJ3o2i0vbL6q6YewwJ6FK/UJBJeTIoX5fkU3osS14o+zGr3IeHHGDQgAHHwxXmaWcG3cuOx0IHZqKFqQ5KqGxT7HmWUgDY72XoLpVfNxoZbtsDP/qnJpGw8pWXzBcCgm7QWK8ZaoCeXUaLvs28o2LInZu+RY+pKR4mL2Wx9fX3HFw2z6F1ACLYTCLYYb4+FOFfnhEKjn9IeAU/aIr0+olFuwzWFyvW/ED+MjZ1bw81R0nzddzDt/HO61Sft+4xJOYFCuQOnL1H91VTxnlLCZwTT+Ynt3ZJz2MQO7R4yHAVXPHGxj8PAP0DS2QpoxIrqIM1MXQ64lBAnxTz3f1g==
+"""
+$description Turkish live TV channel owned by Fox Network.
+$url fox.com.tr
+$type live
+"""
+
 import re
 
-from ACEStream.PluginsContainer.livestreamer.plugin import Plugin
-from ACEStream.PluginsContainer.livestreamer.plugin.api import http
-from ACEStream.PluginsContainer.livestreamer.plugin.api import validate
-from ACEStream.PluginsContainer.livestreamer.stream import HLSStream
+from streamlink.plugin import Plugin, pluginmatcher
+from streamlink.plugin.api import validate
+from streamlink.stream.hls import HLSStream
 
 
+@pluginmatcher(re.compile(
+    r"https?://(?:www\.)?fox(?:play)?\.com\.tr/",
+))
 class FoxTR(Plugin):
-    """
-    Support for Turkish Fox live stream: http://www.fox.com.tr/canli-yayin
-    """
-    url_re = re.compile(r"http?://www.fox.com.tr/canli-yayin")
-    playervars_re = re.compile(r"desktop.*?:.*?\[.*?\{.*?src.*?:.*?'(.*?)'", re.DOTALL)
-
-    @classmethod
-    def can_handle_url(cls, url):
-        return cls.url_re.match(url) is not None
-
     def _get_streams(self):
-        res = http.get(self.url)
-        match = self.playervars_re.search(res.text)
-        if match:
-            stream_url = match.group(1)
+        re_streams = re.compile(r"""(['"])(?P<url>https://\S+/foxtv\.m3u8\S+)\1""")
+        res = self.session.http.get(self.url, schema=validate.Schema(
+            validate.transform(re_streams.findall),
+        ))
+        for _, stream_url in res:
             return HLSStream.parse_variant_playlist(self.session, stream_url)
 
 

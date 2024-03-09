@@ -1,86 +1,53 @@
-#-plugin-sig:VS0h76V+qIFbbdLhSom+eLz3WUJ9zsI91MEnFpdjN9Rz8YdGKhxxeuJ3eyS2zw5/2P0nu3wDcR/I2wfnsoY1nSU2SpwKcXhRTMzMmtcEhKgAxas3ZyPJl27MWEbj1DKgba+iYyrHfRUFOzGEvMr6wVxkjCrUEN0JIAzlWBtZFo6ZLe6iyfLGm+seQ0Yrg2keG9/XbqqSp2eP9SLhDptKK+WDUDSaqI8PsvLgI5l8aUj3B5sXsEX3RK6J6raXnFfLF27dkwLgNlmVvtnETmraQhULiEU51vV27ohoPOIcK6rkbSZB8tho0YOmPkHE5zusuKdw2LER5NO1vhoTGVI9Gw==
-from __future__ import print_function
+#-plugin-sig:GYswE2/CuIGzOaOG4lJvp8E/PsAs+H5DorUBk+fsQTk/hzDlHf3yszb9/rq5pJfs/9rsg68RCI5NGppF8/a8pBz7iwUrB/wTt41SHQCxqCDO4islYxOZLbopbImIGO/0re0JTPvLuC0EB4PNYZIz/DGpAK2l4YcL+mPO8QSr4Vs/9jprfxGBN7iqLMp7Gn30ZEiOj335/EHkccTwe6mCsJzWuzxWDOBygoIA4GQ//wetJz9iUTWgTsJ7A/zlXx3kMU+B0Fqj24Woog1swL4q0wyoKRTHYkY7Z6czlDlfSmesAchQipNf+hNwruKMWoziX+C8uw4GZ/CovaNrrCEFyg==
+"""
+$description Turkish live TV channels from Dogus Group, including Euro Star, Star and NTV.
+$url eurostartv.com.tr
+$url kralmuzik.com.tr
+$url ntv.com.tr
+$url startv.com.tr
+$type live
+"""
 
 import re
 
-from ACEStream.PluginsContainer.livestreamer.plugin import Plugin
-from ACEStream.PluginsContainer.livestreamer.plugin.api import http
-from ACEStream.PluginsContainer.livestreamer.plugin.api import validate
-from ACEStream.PluginsContainer.livestreamer.stream import HDSStream
-from ACEStream.PluginsContainer.livestreamer.stream import HLSStream
+from streamlink.plugin import Plugin, pluginmatcher
+from streamlink.plugin.api import validate
+from streamlink.stream.hls import HLSStream
 
 
+@pluginmatcher(re.compile(r"https?://(?:www\.)?eurostartv\.com\.tr/canli-izle"))
+@pluginmatcher(re.compile(r"https?://(?:www\.)?kralmuzik\.com\.tr/tv/.+"))
+@pluginmatcher(re.compile(r"https?://(?:www\.)?ntv\.com\.tr/canli-yayin/ntv"))
+@pluginmatcher(re.compile(r"https?://(?:www\.)?startv\.com\.tr/canli-yayin"))
 class Dogus(Plugin):
-    """
-    Support for live streams from Dogus sites include startv, ntv, ntvspor, and kralmuzik
-    """
-
-    url_re = re.compile(r"""https?://(?:www.)?
-        (?:
-            startv.com.tr/canli-yayin|
-            ntv.com.tr/canli-yayin/ntv|
-            ntvspor.net/canli-yayin|
-            kralmuzik.com.tr/tv/kral-tv|
-            kralmuzik.com.tr/tv/kral-pop-tv
-        )/?""", re.VERBOSE)
-    mobile_url_re = re.compile(r"""(?P<q>[\"'])(?P<url>https?://[^'"]*?/live/hls/[^'"]*?\?token=)
-                                   (?P<token>[^'"]*?)(?P=q)""", re.VERBOSE)
-    desktop_url_re = re.compile(r"""(?P<q>[\"'])(?P<url>https?://[^'"]*?/live/hds/[^'"]*?\?token=)
-                                    (?P<token>[^'"]*?)(?P=q)""", re.VERBOSE)
-    token_re = re.compile(r"""token=(?P<q>[\"'])(?P<token>[^'"]*?)(?P=q)""")
-
-    hds_schema = validate.Schema(validate.all(
-        {
-            "success": True,
-            "xtra": {
-                "url": validate.url(),
-                "use_akamai": bool
-            }
-        },
-        validate.get("xtra")
-    ))
-    SWF_URL = "http://dygassets.akamaized.net/player2/plugins/flowplayer/flowplayer.httpstreaming-3.2.11.swf"
-
-    @classmethod
-    def can_handle_url(cls, url):
-        return cls.url_re.match(url) is not None
-
-    def _get_star_streams(self, desktop_url, mobile_url, token=""):
-        if token:
-            self.logger.debug("Opening stream with token: {}", token)
-
-        if mobile_url:
-            for _, s in HLSStream.parse_variant_playlist(self.session,
-                                                         mobile_url + token,
-                                                         headers={"Referer": self.url}).items():
-                yield "live", s
-        if desktop_url:
-            # get the HDS stream URL
-            res = http.get(desktop_url + token)
-            stream_data = http.json(res, schema=self.hds_schema)
-            for _, s in HDSStream.parse_manifest(self.session,
-                                                 stream_data["url"],
-                                                 pvswf=self.SWF_URL,
-                                                 is_akamai=stream_data["use_akamai"],
-                                                 headers={"Referer": self.url}).items():
-                yield "live", s
+    _re_live_hls = re.compile(r"'(https?://[^']+/live/hls/[^']+)'")
+    _re_yt_script = re.compile(r"youtube\.init\('([\w-]{11})'")
 
     def _get_streams(self):
-        res = http.get(self.url)
-        mobile_url_m = self.mobile_url_re.search(res.text)
-        desktop_url_m = self.desktop_url_re.search(res.text)
+        root = self.session.http.get(self.url, schema=validate.Schema(validate.parse_html()))
 
+        # https://www.ntv.com.tr/canli-yayin/ntv?youtube=true
+        yt_iframe = root.xpath("string(.//iframe[contains(@src,'youtube.com')][1]/@src)")
+        # https://www.startv.com.tr/canli-yayin
+        dm_iframe = root.xpath("string(.//iframe[contains(@src,'dailymotion.com')][1]/@src)")
+        # https://www.kralmuzik.com.tr/tv/kral-tv
+        # https://www.kralmuzik.com.tr/tv/kral-pop-tv
+        yt_script = root.xpath("string(.//script[contains(text(), 'youtube.init')][1]/text())")
+        if yt_script:
+            m = self._re_yt_script.search(yt_script)
+            if m:
+                yt_iframe = f"https://www.youtube.com/watch?v={m.group(1)}"
 
-        desktop_url = desktop_url_m and desktop_url_m.group("url")
-        mobile_url = mobile_url_m and mobile_url_m.group("url")
+        iframe = yt_iframe or dm_iframe
+        if iframe:
+            return self.session.streams(iframe)
 
-        token = (desktop_url_m and desktop_url_m.group("token")) or (mobile_url_m and mobile_url_m.group("token"))
-        if not token:
-            # if no token is in the url, try to find it else where in the page
-            token_m = self.token_re.search(res.text)
-            token = token_m and token_m.group("token")
-
-        return self._get_star_streams(desktop_url, mobile_url, token=token)
+        # http://eurostartv.com.tr/canli-izle
+        dd_script = root.xpath("string(.//script[contains(text(), '/live/hls/')][1]/text())")
+        if dd_script:
+            m = self._re_live_hls.search(dd_script)
+            if m:
+                return HLSStream.parse_variant_playlist(self.session, m.group(1))
 
 
 __plugin__ = Dogus

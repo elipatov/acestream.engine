@@ -1,46 +1,29 @@
-#-plugin-sig:UkFvo3PjCj9DyftXcNDrnfytuKuCX3gRfdBuey4lfkEercMuW764pfbyBPMgIZKbA4J1yolytJRmgZbF5zXZ5cMNrhI8+6kDMAbY+H8Kf0tr85o9mKD1n0BWBZkJTkobrncOSBDjjzqWVNUfAkrpuXkcwCzCahhrtyzaMlujN+6tWkT4xFODhgcHSmeR8lNIercMivN8+sFYGXBNFa8bopE9T/Du7rp69dET2xa41dzs2fPyuXJ5amatRgW3PXwGTfAQFYJlGHxVsXduzXnsqim7u4YqVljFVYDHNPWNh6m5Yoj62WLpMPs4f+HVsQ66tAeNlVl5WQOljJi+DTxeeA==
-from __future__ import print_function
+#-plugin-sig:IEuOnAbp2GOrsbH6lEkU36L1IPZP0budMnovMYYmlWjUt9tVl/xj/v8sUHARGeC5jpLUbAHPfAMQzexPB6krhTVXaiEBWvVpgmfMR9646jXarM1xSLfreYCa3bUOowGDHP4LPvCtHNu5+RV2lOs+rlByO5BQ7O3i1HLj8jpuOVe6o7sDka7MHDlkGy6sP0ig5tYhQe3GpB0+ZQbjXu3CtdvZWuiPJ6/K9szlI6nwpp4R/RjUIJJHHpdEv6M52i1/HvV8pMr4kHq4kzIncbrKxk7p63ZDL2x5eKT5++sR1NbQF44W/pYNpJMRN4GXRUJOaX40Srzc14tc+G14zyMilQ==
+"""
+$description A privately owned Turkish live TV channel.
+$url tv360.com.tr
+$type live
+"""
+
 import re
-from functools import partial
 
-from ACEStream.PluginsContainer.livestreamer.plugin import Plugin
-from ACEStream.PluginsContainer.livestreamer.plugin.api import http
-from ACEStream.PluginsContainer.livestreamer.plugin.api import validate
-from ACEStream.PluginsContainer.livestreamer.stream import HLSStream
-from ACEStream.PluginsContainer.livestreamer.utils import parse_json
+from streamlink.plugin import Plugin, pluginmatcher
+from streamlink.plugin.api import validate
+from streamlink.stream.hls import HLSStream
 
 
+@pluginmatcher(re.compile(
+    r"https?://(?:www\.)?tv360\.com\.tr/canli-yayin",
+))
 class TV360(Plugin):
-    url_re = re.compile(r"https?://(?:www.)?tv360.com.tr/CanliYayin")
-    data_re = re.compile(r'''div.*?data-tp=(?P<q>["'])(?P<data>.*?)(?P=q)''', re.DOTALL)
-    _js_to_json = partial(re.compile(r"""(\w+):(["']|\d+,|true|false)""").sub, r'"\1":\2')
-    data_schema = validate.Schema(
-        validate.transform(data_re.search),
-        validate.any(
-            None,
-            validate.all(
-                validate.get("data"),
-                validate.transform(_js_to_json),
-                validate.transform(lambda x: x.replace("'", '"')),
-                validate.transform(parse_json),
-                {
-                    "tp_type": "hls4",
-                    "tp_file": validate.url(),
-                }
-            )
-        )
-    )
-
-    @classmethod
-    def can_handle_url(cls, url):
-        return cls.url_re.match(url) is not None
-
     def _get_streams(self):
-        res = http.get(self.url)
-        data = self.data_schema.validate(res.text)
-
-        if data:
-            return HLSStream.parse_variant_playlist(self.session, data["tp_file"])
+        hls_url = self.session.http.get(self.url, schema=validate.Schema(
+            validate.parse_html(),
+            validate.xml_xpath_string(".//video/source[@src][@type='application/x-mpegURL'][1]/@src"),
+            validate.none_or_all(validate.url()),
+        ))
+        if hls_url:
+            return HLSStream.parse_variant_playlist(self.session, hls_url)
 
 
 __plugin__ = TV360

@@ -1,5 +1,5 @@
  # Ace Stream Engine
-Ace Stream Engine for Raspberry Pi 4 (ARMv7).
+Ace Stream Engine for Raspberry Pi 4 (ARMv8).
 
 Official web site http://www.acestream.org/
 

@@ -1,39 +1,90 @@
-#-plugin-sig:RmqZsvFGwgzVdDc9qxhclw7ZITVuxFpNFFnaR9sHT1hA3zbL/VDZvt2WHBsxy9ew6wyx21mfEP3XFuVYNewOfe5GfJsUQgTvxq0t0ffUZJl8bDP5ypGvZX0ceXC/pUyNGmWGq+OUA+LzG/znmnn6IVW+rXNi9QMUFOdOJYCvk9Bepzo6iQ5Pbpaeaf2lliw1oNJW29RPpEyfLhAuvpxuERrLO0DaBPDf7SCTFokigKamaVHoHSV5p+aaS4kQ+37XuIjWjdV/iU4co7mvG0YS7cFyVVId/kRkexrKVNbVp5Fvp/wYuz/W/1wO8ggHGyZHYD+8ay3xOSxfGoDi1P8tsw==
-from __future__ import print_function
+#-plugin-sig:nP4oVz0yrXSqJGR/OexHKJKkIsLsvIo8Xg3yaQ8emQqLYMe0B++o804vyOWZOkgE0H/IpBprDheHakkfcRj2O28M4edDE2HmJud4VcdPKXn/WGw843e89atagSqiH00TXEl7JsLOcfF18hxttiXr+3I+MINx/hDtCOdSn8XAcjnK+wz0+GbNARaPWGLmj57TKi1nTQl0DyA0X0dyGyazsRaEPHl2hcY/6vtD1hYTa4obNt7Nux6Bh3zQjGOBvanRrctpOP2fuxpgcI4YeEWfq/AbePK9PmyUZZnAnIyPXBw5gT73q1z9/7CiJCQsUS8Q3MgZBhExDA+8wfz/X/ydOQ==
+"""
+$description Spanish live TV channels from Atresmedia Television, including Antena 3 and laSexta.
+$url atresplayer.com
+$type live
+$region Spain
+"""
+
+import logging
 import re
-import time
-import random
+from urllib.parse import urlparse
 
-from ACEStream.PluginsContainer.livestreamer.plugin import Plugin
-from ACEStream.PluginsContainer.livestreamer.plugin.api import http
-from ACEStream.PluginsContainer.livestreamer.plugin.api import validate
-from ACEStream.PluginsContainer.livestreamer.stream import HDSStream
+from streamlink.plugin import Plugin, pluginmatcher
+from streamlink.plugin.api import validate
+from streamlink.stream.dash import DASHStream
+from streamlink.stream.hls import HLSStream
+from streamlink.utils.url import update_scheme
 
 
+log = logging.getLogger(__name__)
+
+
+@pluginmatcher(re.compile(
+    r"https?://(?:www\.)?atresplayer\.com/",
+))
 class AtresPlayer(Plugin):
-    url_re = re.compile(r"https?://(?:www.)?atresplayer.com/directos/television/(\w+)/?")
-    player_re = re.compile(r"""div.*?directo=(\d+)""")
-    stream_api = "https://servicios.atresplayer.com/api/urlVideoLanguage/v3/{id}/web/{id}|{time}|{hash}/es.xml"
-    manifest_re = re.compile(r"<resultDes>(.+)?</resultDes>")
-
-    @classmethod
-    def can_handle_url(cls, url):
-        return cls.url_re.match(url) is not None
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.url = update_scheme("https://", f"{self.url.rstrip('/')}/")
 
     def _get_streams(self):
-        res = http.get(self.url)
-        match = self.player_re.search(res.text)
-        if match:
-            channel_id = match.group(1)
+        path = urlparse(self.url).path
+        api_url = self.session.http.get(self.url, schema=validate.Schema(
+            re.compile(r"""window.__PRELOADED_STATE__\s*=\s*({.*?});""", re.DOTALL),
+            validate.none_or_all(
+                validate.get(1),
+                validate.parse_json(),
+                {"links": {path: {"href": validate.url()}}},
+                validate.get(("links", path, "href")),
+            ),
+        ))
+        if not api_url:
+            return
+        log.debug(f"API URL: {api_url}")
 
-            stream_api = self.stream_api.format(id=channel_id,
-                                                time=int(time.time()),
-                                                hash=''.join(random.choice("abcdef0123456789") for x in range(28)))
+        player_api_url = self.session.http.get(api_url, schema=validate.Schema(
+            validate.parse_json(),
+            {"urlVideo": validate.url()},
+            validate.get("urlVideo"),
+        ))
 
-            res = http.get(stream_api)
-            f4m_url = self.manifest_re.search(res.text)
-            if f4m_url:
-                return HDSStream.parse_manifest(self.session, f4m_url.group(1))
+        log.debug(f"Player API URL: {player_api_url}")
+        sources = self.session.http.get(player_api_url, acceptable_status=(200, 403), schema=validate.Schema(
+            validate.parse_json(),
+            validate.any(
+                {
+                    "error": str,
+                    "error_description": str,
+                },
+                {
+                    "sources": [
+                        validate.all(
+                            {
+                                "src": validate.url(),
+                                validate.optional("type"): str,
+                            },
+                            validate.union_get("type", "src"),
+                        ),
+                    ],
+                },
+            ),
+        ))
+        if "error" in sources:
+            log.error(f"Player API error: {sources['error']} - {sources['error_description']}")
+            return
+
+        for streamtype, streamsrc in sources.get("sources"):
+            log.debug(f"Stream source: {streamsrc} ({streamtype or 'n/a'})")
+
+            if streamtype == "application/vnd.apple.mpegurl":
+                streams = HLSStream.parse_variant_playlist(self.session, streamsrc)
+                if not streams:
+                    yield "live", HLSStream(self.session, streamsrc)
+                else:
+                    yield from streams.items()
+            elif streamtype == "application/dash+xml":
+                yield from DASHStream.parse_manifest(self.session, streamsrc).items()
 
 
 __plugin__ = AtresPlayer

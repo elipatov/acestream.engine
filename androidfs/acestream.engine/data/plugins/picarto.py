@@ -1,71 +1,152 @@
-#-plugin-sig:VYvgm/cO7VxSMuQ6MTU1XRGVT7BojNB3y7BRiNIdMucy+GlV7hWcp37hVFibQeYtCD52kMcy6OY5gVUwcuhqZD+SjdNJY4HMPzT70KsDHletHpsRXk3upSePHDGs7xnP7W50rbM3x0/cayvLl1kM18T6gFQ/1mwHffLXfHcYytRv1jqQ0LW8myMwS5tk1dIxCOuWE4oQRQayfe7zfVqeuhXkOkwp+nYM+mgS00HEMMpVQh0fAAeLyOz7FZWA47HNXsyDqU4NH+WnL7HfgJhZFAFA0i9HNy2xOo2zb1Evr5hUrC64SylBBRawS83vDObI10gzDJgFJKJRS3Bifp3zdw==
+#-plugin-sig:QvjOWn2DIJE63TboehQMNNkuSwpTcMdHHs9Cszr0yXRY7lmZTkejXkcg0kMGAjtSB8EgYRNFfJFCjBFBrJ+uEsUZhQtZ+fu0SgdB0feGUHqtbK5X91EHEkREA17859AsIk5u+R2YUO2V3byX+h7VZBx/cZ0SdeTE3H3ESTC25AqwZMMGESnVzNJE0CrRF/Q+0xq5lBNGxgwHR0goJfbx7JxEW+f8heLpjBeVp8qJpKoxD0Q56kPLbyzWGEBVNbkpoesP0DkQ2N2CVU6z8i/lyOnOT3kiX5kad7p7mA0tvFKXsHoKwLKx4C+Pw47IyY/AieaZVnifEsV2a24lVv6e2A==
+"""
+$description Global live streaming and video hosting platform for the creative community.
+$url picarto.tv
+$type live, vod
+"""
+
+import logging
 import re
+from textwrap import dedent
+from urllib.parse import urlparse
 
-from ACEStream.PluginsContainer.livestreamer.plugin import Plugin
-from ACEStream.PluginsContainer.livestreamer.plugin.api import http
-from ACEStream.PluginsContainer.livestreamer.stream import HLSStream
-from ACEStream.PluginsContainer.livestreamer.stream import RTMPStream
-
-API_CHANNEL_INFO = "https://picarto.tv/process/channel"
-RTMP_URL = "rtmp://{}:1935/play/"
-RTMP_PLAYPATH = "golive+{}?token={}"
-HLS_URL = "https://{}/hls/{}/index.m3u8?token={}"
-
-_url_re = re.compile(r"""
-    https?://(\w+\.)?picarto\.tv/[^&?/]
-""", re.VERBOSE)
-
-# placeStream(channel, playerID, product, offlineImage, online, token, tech)
-_channel_casing_re = re.compile(r"""
-    <script>\s*placeStream\s*\((.*?)\);?\s*</script>
-""", re.VERBOSE)
+from streamlink.plugin import Plugin, pluginmatcher
+from streamlink.plugin.api import validate
+from streamlink.stream.hls import HLSStream
 
 
+log = logging.getLogger(__name__)
+
+
+@pluginmatcher(re.compile(r"""
+    https?://(?:www\.)?picarto\.tv/
+    (?:
+        streampopout/(?P<po_user>[^/]+)/public
+    |
+        videopopout/(?P<po_vod_id>\d+)
+    |
+        [^/]+/videos/(?P<vod_id>\d+)
+    |
+        (?P<user>[^/?&]+)
+    )$
+""", re.VERBOSE))
 class Picarto(Plugin):
-    @classmethod
-    def can_handle_url(cls, url):
-        return _url_re.match(url) is not None
+    API_URL_LIVE = "https://ptvintern.picarto.tv/api/channel/detail/{username}"
+    API_URL_VOD = "https://ptvintern.picarto.tv/ptvapi"
+    HLS_URL = "https://{netloc}/stream/hls/{file_name}/index.m3u8"
 
-    @staticmethod
-    def _get_stream_arguments(page):
-        match = _channel_casing_re.search(page.text)
-        if not match:
-            raise ValueError
+    def get_live(self, username):
+        channel, multistreams, loadbalancer = self.session.http.get(
+            self.API_URL_LIVE.format(username=username),
+            schema=validate.Schema(
+                validate.parse_json(),
+                {
+                    "channel": validate.any(None, {
+                        "stream_name": str,
+                        "title": str,
+                        "online": bool,
+                        "private": bool,
+                        "categories": [{"label": str}],
+                    }),
+                    "getMultiStreams": validate.any(None, {
+                        "multistream": bool,
+                        "streams": [{
+                            "name": str,
+                            "online": bool,
+                        }],
+                    }),
+                    "getLoadBalancerUrl": validate.any(None, {
+                        "url": validate.any(None, validate.transform(lambda url: urlparse(url).netloc)),
+                    }),
+                },
+                validate.union_get("channel", "getMultiStreams", "getLoadBalancerUrl"),
+            ),
+        )
+        if not channel or not multistreams or not loadbalancer:
+            log.debug("Missing channel or streaming data")
+            return
 
-        # transform the arguments
-        channel, player_id, product, offline_image, online, visibility, is_flash = \
-            map(lambda a: a.strip("' \""), match.group(1).split(","))
-        player_id, product, offline_image, online, is_flash = \
-            map(lambda a: bool(int(a)), [player_id, product, offline_image, online, is_flash])
+        log.trace(f"loadbalancer={loadbalancer!r}")
+        log.trace(f"channel={channel!r}")
+        log.trace(f"multistreams={multistreams!r}")
 
-        return channel, player_id, product, offline_image, online, visibility, is_flash
+        if not channel["online"]:
+            log.error("User is not online")
+            return
+
+        if channel["private"]:
+            log.info("This is a private stream")
+            return
+
+        self.author = username
+        self.category = channel["categories"][0]["label"]
+        self.title = channel["title"]
+
+        hls_url = self.HLS_URL.format(
+            netloc=loadbalancer["url"],
+            file_name=channel["stream_name"],
+        )
+
+        return HLSStream.parse_variant_playlist(self.session, hls_url)
+
+    def get_vod(self, vod_id):
+        data = {
+            "query": dedent("""
+                query ($videoId: ID!) {
+                  video(id: $videoId) {
+                    id
+                    title
+                    file_name
+                    video_recording_image_url
+                    channel {
+                      name
+                    }
+                  }
+                }
+            """).lstrip(),
+            "variables": {"videoId": vod_id},
+        }
+        vod_data = self.session.http.post(self.API_URL_VOD, json=data, schema=validate.Schema(
+            validate.parse_json(),
+            {"data": {
+                "video": validate.any(None, {
+                    "id": int,
+                    "title": str,
+                    "file_name": str,
+                    "video_recording_image_url": str,
+                    "channel": {"name": str},
+                }),
+            }},
+            validate.get(("data", "video")),
+        ))
+
+        if not vod_data:
+            log.debug("Missing video data")
+            return
+
+        log.trace(f"vod_data={vod_data!r}")
+
+        self.author = vod_data["channel"]["name"]
+        self.category = "VOD"
+        self.title = vod_data["title"]
+
+        netloc = urlparse(vod_data["video_recording_image_url"]).netloc
+        hls_url = self.HLS_URL.format(
+            netloc=netloc,
+            file_name=vod_data["file_name"],
+        )
+
+        return HLSStream.parse_variant_playlist(self.session, hls_url)
 
     def _get_streams(self):
-        page = http.get(self.url)
+        m = self.match.groupdict()
 
-        try:
-            channel, _, _, _, online, visibility, is_flash = self._get_stream_arguments(page)
-        except ValueError:
-            return
+        if m["po_vod_id"] or m["vod_id"]:
+            log.debug("Type=VOD")
+            return self.get_vod(m["po_vod_id"] or m["vod_id"])
+        elif m["po_user"] or m["user"]:
+            log.debug("Type=Live")
+            return self.get_live(m["po_user"] or m["user"])
 
-        if not online:
-            self.logger.error("This stream is currently offline")
-            return
-
-        channel_server_res = http.post(API_CHANNEL_INFO, data={
-            "loadbalancinginfo": channel
-        })
-
-        if is_flash:
-            return {"live": RTMPStream(self.session, {
-                "rtmp": RTMP_URL.format(channel_server_res.text),
-                "playpath": RTMP_PLAYPATH.format(channel, visibility),
-                "pageUrl": self.url,
-                "live": True
-            })}
-        else:
-            return HLSStream.parse_variant_playlist(self.session,
-                                                    HLS_URL.format(channel_server_res.text, channel, visibility),
-                                                    verify=False)
 
 __plugin__ = Picarto

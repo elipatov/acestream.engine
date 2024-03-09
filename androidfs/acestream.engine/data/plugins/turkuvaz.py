@@ -1,50 +1,82 @@
-#-plugin-sig:Dl/j+r1rvRAxfpO3ThOiokGseTmuB9+5F/kU5eiizFhHR5l/0SPWgZVVyN4jENDsdyxHcpHxlbFRnCZR4fJ/bbKiXHlFhIIFD5cPy8x64TZ4KDaFR5mKh/Gx8D8Th8MctIyPkRmn+Q/t7N6KrpJRqfzq/9toMxSwuRi43IorNtMRfvUEYfcKT0253xOEBYIixBvVUe8qO1BD7wOMnC4VLYYeiRnFPDHpkcNZKFFq3Vh4qFdm0ONLs+veqOWvyEGb+/JR7ckC9a0pUD7Bx5tJ4/slprima1F8TPVxcyIHvVWdQhdNC6nLAs/uFCx+f4rNQcF+0bEaeMaLsOQm31qpVQ==
-import random
+#-plugin-sig:JqcyHYnV2hv57lYMDj6Pw+nVmU4iCs9W9ZC03KTv2Ka3P/E0YItHPl/R8d+T/BbROtXAEitPGVIkWdOp8WXbPu2V/pY8ZpWjaCDTx7JOf2JM9/CuL2/kHsy2+NQa+9ITzIrgIvMEm71/ix1gsMRihWyQLXGkkcaAlTANKFSOM0OZdwtqxOALZF8nuqD/hWvrtfUCmj+qwmFrxDtBlleY4VIv6e3q+VEcZK8Kr+X8GRFNfGkE1D6EvoAfDMWPw86eoYr0GT3QjDklX7Iusc/a5c/2vapeNzri4MVLah5NM6ngUJl0qVquKu3GaQ/yLQCuTSIopAAAr9mK1v001C2fBQ==
+"""
+$description Turkish live TV channels from Turkuvaz Media Group, including Ahaber, ATV, Minika COCUK and MinikaGO.
+$url a2tv.com.tr
+$url ahaber.com.tr
+$url anews.com.tr
+$url apara.com.tr
+$url aspor.com.tr
+$url atv.com.tr
+$url atvavrupa.tv
+$url minikacocuk.com.tr
+$url minikago.com.tr
+$url vavtv.com.tr
+$type live
+$region various
+"""
+
 import re
-from ACEStream.PluginsContainer.livestreamer.plugin import Plugin
-from ACEStream.PluginsContainer.livestreamer.plugin.api import http
-from ACEStream.PluginsContainer.livestreamer.plugin.api import validate
-from ACEStream.PluginsContainer.livestreamer.stream import HLSStream
+from urllib.parse import urlparse
+
+from streamlink.plugin import Plugin, pluginmatcher
+from streamlink.plugin.api import validate
+from streamlink.stream.hls import HLSStream
 
 
-class Turkuvaz(Plugin):
-    """
-    Plugin to support ATV/A2TV Live streams from www.atv.com.tr and www.a2tv.com.tr
-    """
-
-    _url_re = re.compile(r"""https?://(?:www.)?
-            (?:
-                (atv|a2tv|ahaber|aspor|minikago|minikacocuk).com.tr/webtv/canli-yayin|
-                (atvavrupa).tv/webtv/videoizle/atv_avrupa/canli_yayin
-            )""", re.VERBOSE)
-    _hls_url = "http://trkvz-live.ercdn.net/{channel}/{channel}.m3u8"
-    _token_url = "http://videotoken.tmgrup.com.tr/webtv/secure"
-    _token_schema = validate.Schema(validate.all(
-        {
-            "Success": True,
-            "Url": validate.url(),
-        },
-        validate.get("Url"))
+@pluginmatcher(re.compile(r"""
+    https?://(?:www\.)?
+    (?:
+        (?:
+            atvavrupa\.tv
+            |
+            (?:atv|a2tv|ahaber|aspor|minikago|minikacocuk|anews)\.com\.tr
+        )/webtv/(?:live-broadcast|canli-yayin)
+        |
+        ahaber\.com\.tr/video/canli-yayin
+        |
+        (?:atv|apara|vavtv)\.com\.tr/canli-yayin
+        |
+        atv\.com\.tr/a2tv/canli-yayin
     )
+""", re.VERBOSE))
+class Turkuvaz(Plugin):
+    _URL_HLS = "https://trkvz-live.ercdn.net/{channel}/{channel}.m3u8"
+    _URL_TOKEN = "https://securevideotoken.tmgrup.com.tr/webtv/secure"
 
-    @classmethod
-    def can_handle_url(cls, url):
-        return cls._url_re.match(url) is not None
+    _MAP_HOST_TO_CHANNEL = {
+        "atv": "atvhd",
+        "ahaber": "ahaberhd",
+        "apara": "aparahd",
+        "aspor": "asporhd",
+        "anews": "anewshd",
+        "vavtv": "vavtv",
+        "minikacocuk": "minikagococuk",
+    }
 
     def _get_streams(self):
-        url_m = self._url_re.match(self.url)
-        domain = url_m.group(1) or url_m.group(2)
+        hostname = re.sub(r"^www\.", "", urlparse(self.url).netloc).split(".")[0]
+
         # remap the domain to channel
-        channel = {"atv": "atvhd",
-                   "ahaber": "ahaberhd",
-                   "aspor": "asporhd"}.get(domain, domain)
+        channel = self._MAP_HOST_TO_CHANNEL.get(hostname, hostname)
+        hls_url = self._URL_HLS.format(channel=channel)
 
-        hls_url = self._hls_url.format(channel=channel)
         # get the secure HLS URL
-        res = http.get(self._token_url, params={"url": hls_url})
-        secure_hls_url = http.json(res, schema=self._token_schema)
+        secure_hls_url = self.session.http.get(
+            self._URL_TOKEN,
+            params=f"url={hls_url}",
+            headers={"Referer": self.url},
+            schema=validate.Schema(
+                validate.parse_json(),
+                {
+                    "Success": True,
+                    "Url": validate.url(),
+                },
+                validate.get("Url"),
+            ),
+        )
 
-        return HLSStream.parse_variant_playlist(self.session, secure_hls_url)
+        if secure_hls_url:
+            return HLSStream.parse_variant_playlist(self.session, secure_hls_url)
 
 
 __plugin__ = Turkuvaz

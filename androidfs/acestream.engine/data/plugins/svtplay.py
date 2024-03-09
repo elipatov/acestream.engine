@@ -1,92 +1,156 @@
-#-plugin-sig:FeeyzawwL+Big/ADQiBwyfiJFvmPZzekZtc4pJYUAxgQ+Uh51oDaU6yuFjPFZyLvZyXBykKHqFMIIXeG0/wmDfGu8ioz8GALQpGPDecUhQuHw993N57/gJCqVvCLrZZMqEWCiYBu5j8dd2DQ9P02tZADw94ZjHpisSgCKW9+vO90MxGmldOxuqRCpv2zDpW/grFr/aOJbUbaofKIWoZalRHifJVfXT6SnxdToqub3Ujs3RVzMn1dZ9C55DonaTtoUQHVLSK2WTUJcrKks/8f6cdDZ0DokMxNVnoGXtusS2r5l19pvf1Y3S2njJbAQsek8PGzrK0UIjy/5fiIHtHUaQ==
+#-plugin-sig:nVqEtmv5H7dM2dNXwny6+otAYL1PWjlZE05by4+LxXI1NupIkypFJoUWPPZk4LfkaM59as4MhVDiwoKRrywnlBSxG7QAYJkbsJFWhWrj2wqkXA81vmMOKKpX6fLzBwkMnVE5lrpoXGQeAqo0WNPhrZvflHcy3A9oaME84Hofm6wCK8V9swFQgOodVY/EKSJYOSE2BUvoO0H9gfhBMhBOwmh1j6WRKuXSsqEOGfPfTjb5Gv71eyH1DA0EF14p18oIE576LJr/dHCn2XtJJ2vKfBLsqnCVhtEEINK2Q+Ikm4Fn5AXAwZ7fj+zpp31/AffloNrk6ODFlast4MVGhyPk7Q==
+"""
+$description Live TV channels and video on-demand service from SVT, a Swedish public, state-owned broadcaster.
+$url svtplay.se
+$type live, vod
+$region Sweden
+"""
+
+import logging
 import re
+from urllib.parse import parse_qsl, urlparse
 
-from ACEStream.PluginsContainer.livestreamer.plugin import Plugin
-from ACEStream.PluginsContainer.livestreamer.plugin.api import StreamMapper, http, validate
-from ACEStream.PluginsContainer.livestreamer.stream import HLSStream, HDSStream
-
-API_URL = "http://www.svt.se/videoplayer-api/video/{0}"
-
-_url_re = re.compile("""
-    http(s)?://
-    (www\.)?
-    (?:
-        svtplay |
-        svtflow |
-        oppetarkiv
-    )
-    .se
-""", re.VERBOSE)
-
-# Regex to match video ID
-_id_re = re.compile(r"""data-video-id=['"](?P<id>[^'"]+)['"]""")
-_old_id_re = re.compile(r"/(?:video|klipp)/(?P<id>[0-9]+)/")
-
-# New video schema used with API call
-_video_schema = validate.Schema(
-    {
-        "videoReferences": validate.all(
-            [{
-                "url": validate.text,
-                "format": validate.text
-            }],
-        ),
-    },
-    validate.get("videoReferences")
-)
-
-# Old video schema
-_old_video_schema = validate.Schema(
-    {
-        "video": {
-            "videoReferences": validate.all(
-                [{
-                    "url": validate.text,
-                    "playerType": validate.text
-                }],
-            ),
-        }
-    },
-    validate.get("video"),
-    validate.get("videoReferences")
-)
+from streamlink.plugin import Plugin, pluginmatcher
+from streamlink.plugin.api import validate
+from streamlink.stream.dash import DASHStream
+from streamlink.stream.ffmpegmux import MuxedStream
+from streamlink.stream.hls import HLSStream
+from streamlink.stream.http import HTTPStream
 
 
+log = logging.getLogger(__name__)
+
+
+@pluginmatcher(re.compile(
+    r"https?://(?:www\.)?svtplay\.se/(?P<live>kanaler/)?",
+))
 class SVTPlay(Plugin):
-    @classmethod
-    def can_handle_url(self, url):
-        return _url_re.match(url)
+    _URL_API_VIDEO = "https://api.svt.se/videoplayer-api/video/{item}"
+    _MAP_CHANNEL_NAMES = {
+        "svt1": "ch-svt1",
+        "svt2": "ch-svt2",
+        "svtbarn": "ch-barnkanalen",
+        "kunskapskanalen": "ch-kunskapskanalen",
+        "svt24": "ch-svt24",
+    }
 
-    def _create_streams(self, stream_type, parser, video):
-        try:
-            streams = parser(self.session, video["url"])
-            return streams.items()
-        except IOError as err:
-            self.logger.error("Failed to extract {0} streams: {1}",
-                              stream_type, err)
+    def _api_call(self, item):
+        _schema_items = validate.all(
+            [
+                validate.all(
+                    {
+                        "format": str,
+                        "url": validate.url(),
+                    },
+                    validate.union_get("format", "url"),
+                ),
+            ],
+            validate.transform(dict),
+        )
+
+        self.author, self.title, videos, subtitles = self.session.http.get(
+            self._URL_API_VIDEO.format(item=item),
+            schema=validate.Schema(
+                validate.parse_json(),
+                {
+                    validate.optional("programTitle"): str,
+                    validate.optional("episodeTitle"): str,
+                    "videoReferences": _schema_items,
+                    validate.optional("subtitleReferences"): _schema_items,
+                },
+                validate.union_get(
+                    "programTitle",
+                    "episodeTitle",
+                    "videoReferences",
+                    "subtitleReferences",
+                ),
+            ),
+        )
+
+        return videos, subtitles
+
+    def _get_live(self):
+        live_id = "/".join(urlparse(self.url).path.split("/")[2:])
+        if not live_id:
+            return
+
+        live_id = self._MAP_CHANNEL_NAMES.get(live_id, f"ch-{live_id}")
+        log.debug(f"Live ID={live_id}")
+        self.category = "Live"
+        videos, subtitles = self._api_call(live_id)
+
+        return self._select_streams(videos, subtitles)
+
+    def _get_vod(self):
+        def get_vod_id(url):
+            return dict(parse_qsl(urlparse(url).query)).get("id")
+
+        vod_id = get_vod_id(self.url)
+
+        if vod_id is None:
+            vod_url = self.session.http.get(self.url, schema=validate.Schema(
+                validate.parse_html(),
+                validate.xml_xpath_string(".//*[@data-rt='top-area-play-button'][@href][1]/@href"),
+            ))
+            if vod_url:
+                vod_id = get_vod_id(vod_url)
+
+        if vod_id is None:
+            return
+
+        log.debug(f"VOD ID={vod_id}")
+        self.category = "Live"
+        videos, subtitles = self._api_call(vod_id)
+
+        return self._select_streams(videos, subtitles)
+
+    def _select_streams(self, videos, subtitles):
+        # the goal is to have streams with the widest range of qualities/substreams and highest bitrate at the top
+        stream_priorities = {
+            "dashhbbtv": DASHStream,  # DASH AVC
+            "dash-hbbtv-avc": DASHStream,  # DASH AVC
+            "dash-avc": DASHStream,  # DASH AVC
+            "dash-full": DASHStream,  # DASH AVC
+            "dash": DASHStream,  # DASH AVC
+
+            "hlswebvtt": HLSStream,  # HLS with subtitles
+            "hls-cmaf-live-vtt": HLSStream,  # HLS with subtitles
+            "hls-ts-avc": HLSStream,  # HLS with MPEG-TS
+            "hls-ts-full": HLSStream,  # HLS with MPEG-TS
+            "hls": HLSStream,  # HLS with MPEG-TS
+            "hls-cmaf-live": HLSStream,  # HLS with fMP4
+            "hls-cmaf-full": HLSStream,  # HLS with fMP4
+
+            "dash-hbbtv-hevc": DASHStream,  # DASH HEVC (low prio, because of potential user decoder issues)
+
+            "hls-ts-lb-full": HLSStream,  # low bitrate
+            "hls-cmaf-lb-full": HLSStream,  # low bitrate
+            "dash-lb-full": DASHStream,  # low bitrate
+        }
+
+        for fmt, streamtype in stream_priorities.items():
+            if fmt not in videos:
+                continue
+
+            if streamtype is HLSStream:
+                return HLSStream.parse_variant_playlist(self.session, videos[fmt], name_fmt="{pixels}_{bitrate}")
+
+            if streamtype is DASHStream:
+                subtitlestreams = {}
+                if self.session.get_option("mux-subtitles") and "webvtt" in subtitles:
+                    subtitlestreams["webvtt"] = HTTPStream(self.session, subtitles["webvtt"])
+
+                dash_streams = DASHStream.parse_manifest(self.session, videos[fmt])
+                if not subtitlestreams:
+                    return dash_streams
+
+                return {q: MuxedStream(self.session, s, subtitles=subtitlestreams) for q, s in dash_streams.items()}
 
     def _get_streams(self):
-        # Retrieve URL page and search for new type of video ID
-        res = http.get(self.url)
-        match = _id_re.search(res.text)
-
-        # Use API if match, otherwise resort to old method
-        if match:
-            vid = match.group("id")
-            res = http.get(API_URL.format(vid))
-
-            videos = http.json(res, schema = _video_schema)
-            mapper = StreamMapper(cmp = lambda format, video: video["format"] == format)
-            mapper.map("hls", self._create_streams, "HLS", HLSStream.parse_variant_playlist)
-            mapper.map("hds", self._create_streams, "HDS", HDSStream.parse_manifest)
+        if self.match["live"]:
+            return self._get_live()
         else:
-            res = http.get(self.url, params=dict(output="json"))
-            videos = http.json(res, schema=_old_video_schema)
+            return self._get_vod()
 
-            mapper = StreamMapper(cmp=lambda type, video: video["playerType"] == type)
-            mapper.map("ios", self._create_streams, "HLS", HLSStream.parse_variant_playlist)
-            mapper.map("flash", self._create_streams, "HDS", HDSStream.parse_manifest)
-
-        return mapper(videos)
 
 __plugin__ = SVTPlay

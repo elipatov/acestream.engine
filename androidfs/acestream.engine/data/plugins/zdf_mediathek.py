@@ -1,131 +1,97 @@
-#-plugin-sig:TSqRIsfJA4iXiDWKUq7pt6T9X5qfWo4h9geKPYbq4ieaaEt6iNF38vnUSx2MdnhIJ9vPd1BRWuzsY6FD3BY9rE2hm7reJ2aYSRUUujPIxwd7Gw2njjxQ7X7Cj3exkcIr6eRD+2yEoEhfJF0VZw8u1JJs8P5boG6UHxH9T0DxePsHfOp3R0gI3xg0Ftxh23DucnzDG0O8NLmpD1HFq7pc5AKIF5llA5L7sHCwma5pt1bPwoomZwq8q6Ik5SxWsDw5etDRFvON7nQO4Gu1u4wuzzQFaoIdL0GnNoVQv8o3FH7L38I0CJzsvF26S6PU+mysCxN9WQqYpuubji9JUpVMaQ==
+#-plugin-sig:Q65OqMvh8pj9+2r7eGyOuIolaFsU+GtyTUCsdBjh1Gd0wKOKxTxINu3L25wJiC0zjYgKRlsquaGjLofWQF98qBF0e9sA6bu17KC7NiH3tDHFrZZQR/2BWPJSK5dhMWCrzs3SqOzRZMV6HZ8hYZG1l+VD52lvLv6AuwFWM9ZaJQEpeGaYRyKgsfEwa12lfHONcPD2MVZ7vTyxn3CVcRGYIJle5wSSWv8EeaT2UIVOQrrHwko+ieyX04Xd8SxeeYG6QCFIkxRJCyvlAFivp0HcTXQJYnBa7TK/3PXHyW2yu3LCSgbE/Nb42AhEM+WLkdOK4bngCjpXHoVq7N+PuxxlBA==
+"""
+$description Live TV channels and video on-demand service from ZDF, a German public, independent broadcaster.
+$url zdf.de
+$type live, vod
+$region Germany
+"""
+
+import logging
 import re
+from urllib.parse import urlparse, urlunparse
 
-from ACEStream.PluginsContainer.livestreamer.plugin import Plugin
-from ACEStream.PluginsContainer.livestreamer.plugin.api import http, validate
-from ACEStream.PluginsContainer.livestreamer.stream import HDSStream, HLSStream
-from ACEStream.PluginsContainer.livestreamer.plugin.api.utils import parse_query
+from streamlink.plugin import Plugin, pluginmatcher
+from streamlink.plugin.api import validate
+from streamlink.stream.hls import HLSStream
+from streamlink.utils.url import url_concat
 
-API_URL = "https://api.zdf.de"
 
-QUALITY_WEIGHTS = {
-    "hd": 720,
-    "veryhigh": 480,
-    "high": 240,
-    "med": 176,
-    "low": 112
-}
+log = logging.getLogger(__name__)
 
-STREAMING_TYPES = {
-    "h264_aac_f4f_http_f4m_http": (
-        "HDS", HDSStream.parse_manifest
-    ),
-    "h264_aac_ts_http_m3u8_http": (
-        "HLS", HLSStream.parse_variant_playlist
-    )
-}
 
-_url_re = re.compile("""
-    http(s)?://(\w+\.)?zdf.de/
-""", re.VERBOSE | re.IGNORECASE)
-
-_documents_schema = validate.Schema(
-    {
-        "mainVideoContent": {
-            "http://zdf.de/rels/target": {
-                "http://zdf.de/rels/streams/ptmd": validate.text
-            },
-        },
-    }
-)
-
-_schema = validate.Schema(
-    {
-        "priorityList": [
-            {
-                "formitaeten": [
-                    {
-                        "type": validate.text,
-                        "qualities": [
-                            {
-                                "audio": {
-                                    "tracks": [
-                                        {
-                                            "uri": validate.text
-                                        }
-                                    ]
-                                }
-                            }
-                        ]
-                    }
-                ]
-            }
-        ]
-    }
-)
-
-class zdf_mediathek(Plugin):
-    @classmethod
-    def can_handle_url(cls, url):
-        return _url_re.match(url)
-
-    @classmethod
-    def stream_weight(cls, key):
-        weight = QUALITY_WEIGHTS.get(key)
-        if weight:
-            return weight, "zdf_mediathek"
-
-        return Plugin.stream_weight(key)
-
-    def _extract_streams(self, response):
-        if "priorityList" not in response:
-            self.logger.error("Invalid response! Contains no priorityList!")
-
-        for priority in response["priorityList"]:
-            for format_ in priority["formitaeten"]:
-                yield self._extract_from_format(format_)
-
-    def _parse_track(self, track, parser):
-        try:
-            return parser(self.session, track["uri"])
-        except IOError as err:
-            self.logger.error("Failed to extract {0} streams: {1}", name, err)
-
-    def _extract_from_format(self, format_):
-        qualities = {}
-
-        if format_["type"] not in STREAMING_TYPES:
-            return qualities
-
-        name, parser = STREAMING_TYPES[format_["type"]]
-        for quality in format_["qualities"]:
-            for track in quality["audio"]["tracks"]:
-                option = self._parse_track(track, parser)
-                qualities.update(option)
-
-        return qualities
-            
+@pluginmatcher(re.compile(
+    r"https?://(\w+\.)?(zdf\.de|3sat\.de)/",
+))
+class ZDFMediathek(Plugin):
+    PLAYER_ID = "ngplayer_2_4"
 
     def _get_streams(self):
-        match = _url_re.match(self.url)
-        title = self.url.rsplit('/', 1)[-1]
-        if title.endswith(".html"):
-            title = title[:-5]
+        zdf_json = self.session.http.get(self.url, schema=validate.Schema(
+            validate.parse_html(),
+            validate.xml_xpath_string(".//*[@data-zdfplayer-jsb][1]/@data-zdfplayer-jsb"),
+            validate.none_or_all(
+                validate.parse_json(),
+                {
+                    "apiToken": str,
+                    "content": validate.url(),
+                },
+                validate.union_get("apiToken", "content"),
+            ),
+        ))
+        if zdf_json is None:
+            return
 
-        request_url = "https://api.zdf.de/content/documents/%s.json?profile=player" % title
-        res = http.get(request_url, headers={"Api-Auth" : "Bearer d2726b6c8c655e42b68b0db26131b15b22bd1a32"})
-        document = http.json(res, schema=_documents_schema)
+        apiToken, apiUrl = zdf_json
 
-        stream_request_url = document["mainVideoContent"]["http://zdf.de/rels/target"]["http://zdf.de/rels/streams/ptmd"]
-        stream_request_url = API_URL + stream_request_url
+        headers = {
+            "Accept": "application/vnd.de.zdf.v1.0+json;charset=UTF-8",
+            "Api-Auth": f"Bearer {apiToken}",
+            "Referer": self.url,
+        }
 
-        res = http.get(stream_request_url)
-        res = http.json(res, schema=_schema)
+        pApiUrl = urlparse(apiUrl)
+        apiUrlBase = urlunparse((pApiUrl.scheme, pApiUrl.netloc, "", "", "", ""))
+        apiUrlPath = self.session.http.get(apiUrl, headers=headers, schema=validate.Schema(
+            validate.parse_json(),
+            {"mainVideoContent": {
+                "http://zdf.de/rels/target": {
+                    "http://zdf.de/rels/streams/ptmd-template": str,
+                },
+            }},
+            validate.get(("mainVideoContent", "http://zdf.de/rels/target", "http://zdf.de/rels/streams/ptmd-template")),
+            validate.transform(lambda template: template.format(playerId=self.PLAYER_ID).replace(" ", "")),
+        ))
 
-        streams = {}
-        for format_ in self._extract_streams(res):
-            streams.update(format_)
+        stream_request_url = url_concat(apiUrlBase, apiUrlPath)
+        data = self.session.http.get(stream_request_url, headers=headers, schema=validate.Schema(
+            validate.parse_json(),
+            {"priorityList": [{
+                "formitaeten": validate.all(
+                    [{
+                        "type": str,
+                        "qualities": validate.all(
+                            [{
+                                "quality": str,
+                                "audio": {
+                                    "tracks": [{
+                                        "uri": validate.url(),
+                                    }],
+                                },
+                            }],
+                            validate.filter(lambda obj: obj["quality"] == "auto"),
+                        ),
+                    }],
+                    validate.filter(lambda obj: obj["type"] == "h264_aac_ts_http_m3u8_http"),
+                ),
+            }]},
+            validate.get("priorityList"),
+        ))
 
-        return streams
+        for priority in data:
+            for formitaeten in priority["formitaeten"]:
+                for quality in formitaeten["qualities"]:
+                    for audio in quality["audio"]["tracks"]:
+                        yield from HLSStream.parse_variant_playlist(self.session, audio["uri"], headers=headers).items()
 
-__plugin__ = zdf_mediathek
+
+__plugin__ = ZDFMediathek

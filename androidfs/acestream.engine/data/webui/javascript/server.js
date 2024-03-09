@@ -319,6 +319,16 @@ function show_page(page_id, details) {
         $("#external-playlists-container").show();
         $("#playlist-upload-form .field-select-file").show();
     }
+    else if(page_id == "proxy-server-logos") {
+        tab_id = 15;
+        main_page_id = "proxy-server-main";
+        breadcrumb_path.push({title: 'proxy-server', pageId: "proxy-server-main"});
+        breadcrumb_path.push({title: 'channel-logos'});
+        quick_nav_menu_id = "proxy-server";
+        quick_nav_icon = "icon-proxy";
+        support_ask_category_ = 3;
+        backgroundTaskCategory = "content";
+    }
     else if(page_id == "media-server-add-playlist") {
         tab_id = 3;
         main_page_id = "proxy-server-main";
@@ -1006,19 +1016,28 @@ function get_available_epg_languages(callback)
         });
 }
 
-function get_language_names()
+function get_language_names(callback)
 {
-    var ajaxSettings = {
-        url: '/webui/javascript/languages.json',
-        type: 'GET',
-        dataType: 'json',
-        cache: false,
-        success: function(response) {
-            languageNames = response;
+    if(languageNames && Object.keys(languageNames).length > 0) {
+        // return cached value
+        if(typeof callback === 'function') {
+            callback(languageNames);
         }
-    };
-
-    $.ajax(ajaxSettings);
+    }
+    else {
+        $.ajax({
+            url: '/webui/javascript/languages.json',
+            type: 'GET',
+            dataType: 'json',
+            cache: false,
+            success: function(response) {
+                languageNames = response;
+                if(typeof callback === 'function') {
+                    callback(response);
+                }
+            }
+        });
+    }
 }
 
 function media_owner_changed() {

@@ -186,6 +186,8 @@ var current_page_ = "#proxy-server-playlist",
 			<a data-string-id="info-panel" href="#proxy-server-settings-info" class="item show-page translate"></a>
 			<a data-string-id="parameters" href="#proxy-server-settings" class="item show-page translate"></a>
 			<a data-string-id="imported-playlist" href="#proxy-server-imported-playlists" class="item show-page translate"></a>
+			<a data-string-id="channel-logos" href="#proxy-server-logos" class="item show-page translate"></a>
+			<a data-string-id="program-guide-epg" href="#proxy-server-epg-sources" class="item show-page translate hidden visible-when-user-epg-enabled"></a>
 
 		</nav>
 		<nav class="cbp-spmenu" data-id="broadcasting">
@@ -293,6 +295,7 @@ var current_page_ = "#proxy-server-playlist",
                     <li><a data-string-id="info-panel" href="#proxy-server-settings-info" class="show-page translate"></a></li>
                     <li><a data-string-id="server-settings" href="#proxy-server-settings" class="show-page translate"></a></li>
                     <li><a data-string-id="imported-playlist" href="#proxy-server-imported-playlists" class="show-page translate"></a> </li>
+                    <li><a data-string-id="channel-logos" href="#proxy-server-logos" class="show-page translate"></a> </li>
                     <li><a data-string-id="program-guide-epg" href="#proxy-server-epg-sources" class="show-page translate hidden visible-when-user-epg-enabled"></a></li>
                 </ul>
             </div>
@@ -320,7 +323,7 @@ var current_page_ = "#proxy-server-playlist",
 			<div class="row-fluid">
 				<div class="span12">
 					<div class="widget-box">
-						<div id="tabs" class="widget-content nopadding">
+						<div id="tabs" class="widget-content nopadding" style="display: none;">
 							<ul class="tab-menu" style="display: none;">
 								<li><a href="#tab-playlist"></a></li>
 								<li><a href="#tab-server-settings"></a></li>
@@ -337,6 +340,7 @@ var current_page_ = "#proxy-server-playlist",
 								<li><a href="#tab-epg-sources"></a></li>
 								<li><a href="#tab-server-settings-info"></a></li>
 								<li><a href="#tab-media-server-sync"></a></li>
+								<li><a href="#tab-logos"></a></li>
 							</ul>
 
 							<!-- Playlist -->
@@ -636,6 +640,27 @@ var current_page_ = "#proxy-server-playlist",
 										</div>
 									</div>
 
+									<!-- Custom logo -->
+									<div class="control-group" style="border-bottom: none;">
+										<div class="controls">
+											<span class="translate" data-string-id="add-custom-logo"></span>:
+										</div>
+									</div>
+
+									<div class="control-group">
+										<label class="control-label"><span class="translate" data-string-id="logo-url"></span>:</label>
+										<div class="controls">
+											<input type="text" id="playlist-add-item-logo-url" name="poster" value="" />
+										</div>
+									</div>
+
+									<div class="control-group">
+										<label class="control-label translate" data-string-id="select-logo-file"></label>
+										<div class="controls">
+											<input type="file" name="logo_file" id="playlist-add-item-logo-file" />
+										</div>
+									</div>
+
 									<div class="form-actions">
 										<input class="btn btn-info normal translate" data-string-id="add-to-playlist" data-translate-attr="value" type="button" onclick="playlist_add_item_form_submit();" value="" />
 									</div>
@@ -724,6 +749,48 @@ var current_page_ = "#proxy-server-playlist",
                                 </form>
 							</div>
 							<!-- /External playlists tab -->
+
+							<!-- logos tab -->
+							<div id="tab-logos" class="form-horizontal">
+								<div class="control-group hidden visible-when-epg-enabled">
+									<label class="control-label translate" data-string-id="uploaded-logos"></label>
+									<div class="controls">
+										<span class="logos-count"></span>
+									</div>
+								</div>
+
+								<div class="control-group hidden visible-when-epg-enabled">
+									<label class="control-label translate" data-string-id="remove-all-logos"></label>
+									<div class="controls">
+										<input class="btn btn-info translate" type="button" id="btn_remove_all_logos" value="" data-translate-attr="value" data-string-id="remove-all" />
+									</div>
+								</div>
+
+								<hr/>
+
+								<form action="/server/api?method=upload_logos" id="logos-upload-form" method="post" enctype="multipart/form-data">
+									<input type="hidden" name="redirect" class="redirect-page" data-page-id="proxy-server-logos" value="" />
+									<input type="hidden" name="token" class="form-token" value="" />
+
+                                    <div class="widget-title">
+                                        <h5 class="translate" data-string-id="upload-channel-logos-zip"></h5>
+                                    </div>
+
+                                    <div class="control-group field-select-file">
+                                        <label class="control-label"><span class="translate" data-string-id="select-file"></span>:</label>
+                                        <div class="controls">
+                                            <input type="file" id="upload-logos-file" name="file" />
+                                        </div>
+                                    </div>
+
+                                    <div class="form-actions">
+                                        <input class="btn btn-info normal translate" data-string-id="upload-file" data-translate-attr="value" type="button" id="btn-upload-logos" value="" />
+                                    </div>
+
+                                </form>
+							</div>
+							<!-- /logos tab -->
+
 
 							<!-- Playlist trash -->
 							<div id="tab-playlist-trash" class="form-horizontal">
@@ -1272,7 +1339,7 @@ var current_page_ = "#proxy-server-playlist",
 		<div class="container-fluid">
 			<div class="row-fluid">
 				<div class="span12">
-					<div class="widget-box">
+					<div class="widget-box" style="max-height: 350px; overflow-y: auto;">
 						<div class="widget-title">
 						<h5 class="translate" data-string-id="preferred-epg-languages"></h5>
 						</div>

@@ -1,77 +1,103 @@
-#-plugin-sig:cyJrwjkfotnvGfYGND0AGiq+6HE0YvMZuefSd37IaNvvEulF6b6Oe5mqPyFk051e+6mZbRlGS8XDBQvYC/oyb6OvYEyCcobhq+a4/uO92nTmvWAfHBf4EMTlT0thXulbNfoy362FoYCSxu2RKlSPRU2GoyADClGuQW/qgDfZnpvGyDoAcVSbybgnaXjKGDslBM7qkgRYWLRKBHLAHJz8uGTrc01UEF+6HkVxvej0iVNIrPNG8HEZGtmsZxAUEwvvDLttYi7g9tvZVUGO3ioqz9iTP9/7111KtwaYZpEAqfvX6Il2/5g1pkRG+AVTlmi7CZ3BMBGEXi2wgY+O7wKcQQ==
-"""Plugin for NOS: Nederlandse Omroep Stichting
-
-Supports:
-   MP$: http://nos.nl/uitzending/nieuwsuur.html
-   Live: http://www.nos.nl/livestream/*
-   Tour: http://nos.nl/tour/live
+#-plugin-sig:bQFYVzlkdPBVcXPijHPN80ON1zi3PohLpzxd+W/VxFo6thzk389ocmVqHahYD4zNDtpCSNouXirF7e3oCfM3eEyfYnk1hRaYWq9mKIJSQBQB/efQ1kfPtYAAOzQRclF6m0YdqGVkUO44WTyUfO4dVVsgyoRhynzz3SjEJEW2CWGiNpz87ReGtOyF/CsNTAQrqM6B7QIhKxkZspmV+qPtlF3nifK6jjl3XNvvEsDRPDzAO5nhqOBro47KicteBpWR9nbYmD6pwKjFMVSkP8nhKV2sycmRF1KbSW5UrS+S5qOV66B/Zuptp3feS1B5b3J3+B86J76H029mLWSC94NYzg==
+"""
+$description Live TV channels and video on-demand service from NOS, a Dutch public, state-owned broadcaster.
+$url nos.nl
+$type live, vod
+$region Netherlands
 """
 
+import logging
 import re
-import json
 
-from ACEStream.PluginsContainer.livestreamer.plugin import Plugin
-from ACEStream.PluginsContainer.livestreamer.plugin.api import http
-from ACEStream.PluginsContainer.livestreamer.plugin.api.utils import parse_json
-from ACEStream.PluginsContainer.livestreamer.stream import HTTPStream, HLSStream
-
-_url_re = re.compile("http(s)?://(\w+\.)?nos.nl/")
-_js_re = re.compile('\((.*)\)')
-_data_stream_re = re.compile('data-stream="(.*?)"', re.DOTALL | re.IGNORECASE)
-_source_re = re.compile("<source(?P<source>[^>]+)>", re.IGNORECASE)
-_source_src_re = re.compile("src=\"(?P<src>[^\"]+)\"", re.IGNORECASE)
-_source_type_re = re.compile("type=\"(?P<type>[^\"]+)\"", re.IGNORECASE)
+from streamlink.plugin import Plugin, PluginError, pluginmatcher
+from streamlink.plugin.api import validate
+from streamlink.stream.hls import HLSStream
 
 
+log = logging.getLogger(__name__)
+
+
+@pluginmatcher(re.compile(
+    r"https?://(?:\w+\.)?nos\.nl/(?:livestream|collectie|video|uitzendingen)",
+))
 class NOS(Plugin):
-    @classmethod
-    def can_handle_url(cls, url):
-        return _url_re.match(url)
-
-    def _resolve_stream(self):
-        res = http.get(self.url)
-        match = _data_stream_re.search(res.text)
-        if not match:
-            return
-        data_stream = match.group(1)
-
-        resolve_data = {
-            'stream': data_stream
-        }
-        res = http.post(
-            'http://www-ipv4.nos.nl/livestream/resolve/',
-            data=json.dumps(resolve_data)
-        )
-        data = http.json(res)
-
-        res = http.get(data['url'])
-        match = _js_re.search(res.text)
-        if not match:
-            return
-
-        stream_url = parse_json(match.group(1))
-
-        return HLSStream.parse_variant_playlist(self.session, stream_url)
-
-    def _get_source_streams(self):
-        res = http.get(self.url)
-
-        streams = {}
-        sources = _source_re.findall(res.text)
-        for source in sources:
-            src = _source_src_re.search(source).group("src")
-            pixels = _source_type_re.search(source).group("type")
-
-            streams[pixels] = HTTPStream(self.session, src)
-
-        return streams
+    _msg_live_offline = "This livestream is offline."
+    vod_keys = {
+        "pages/Collection/Video/Video": "item",
+        "pages/Video/Video": "video",
+    }
 
     def _get_streams(self):
-        urlparts = self.url.split('/')
+        try:
+            scripts = self.session.http.get(self.url, schema=validate.Schema(
+                validate.parse_html(),
+                validate.xml_findall(".//script[@type='application/json'][@data-ssr-name]"),
+                [
+                    validate.union((
+                        validate.get("data-ssr-name"),
+                        validate.all(
+                            validate.getattr("text"),
+                            validate.parse_json(),
+                        ),
+                    )),
+                ],
+            ))
+        except PluginError:
+            log.error("Could not find any stream data")
+            return
 
-        if urlparts[-2] == 'livestream' or urlparts[-3] == 'tour':
-            return self._resolve_stream()
-        else:
-            return self._get_source_streams()
+        for _data_ssr_name, _data_json in scripts:
+            video_url = None
+            log.trace(f"Found _data_ssr_name={_data_ssr_name}")
+
+            if _data_ssr_name == "pages/Broadcasts/Broadcasts":
+                self.title, video_url, is_live = validate.Schema(
+                    {"currentLivestream": {
+                        "is_live": bool,
+                        "title": str,
+                        "stream": validate.url(),
+                    }},
+                    validate.get("currentLivestream"),
+                    validate.union_get("title", "stream", "is_live"),
+                ).validate(_data_json)
+                if not is_live:
+                    log.error(self._msg_live_offline)
+                    continue
+
+            elif _data_ssr_name == "pages/Livestream/Livestream":
+                self.title, video_url, is_live = validate.Schema(
+                    {
+                        "streamIsLive": bool,
+                        "title": str,
+                        "stream": validate.url(),
+                    },
+                    validate.union_get("title", "stream", "streamIsLive"),
+                ).validate(_data_json)
+                if not is_live:
+                    log.error(self._msg_live_offline)
+                    continue
+
+            elif _data_ssr_name in self.vod_keys.keys():
+                _key = self.vod_keys[_data_ssr_name]
+                self.title, video_url = validate.Schema(
+                    {_key: {
+                        "title": str,
+                        "aspect_ratios": {
+                            "profiles": validate.all(
+                                [{
+                                    "name": str,
+                                    "url": validate.url(),
+                                }],
+                                validate.filter(lambda p: p["name"] == "hls_unencrypted"),
+                            ),
+                        },
+                    }},
+                    validate.get(_key),
+                    validate.union_get("title", ("aspect_ratios", "profiles", 0, "url")),
+                ).validate(_data_json)
+
+            if video_url is not None:
+                return HLSStream.parse_variant_playlist(self.session, video_url)
+
 
 __plugin__ = NOS

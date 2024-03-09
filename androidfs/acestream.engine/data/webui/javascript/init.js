@@ -1010,9 +1010,8 @@ function init_preferred_epg_languages_popup()
 {
     var $container = $('#preferred-epg-languages-popup .widget-content');
 
-    get_available_epg_languages(function(avail) {
-        for(var i=0; i < avail.length; i++) {
-            var langId = avail[i];
+    get_language_names(function(langs) {
+        for(var langId in langs) {
             if(langId !== "auto") {
                 var langName = get_lang_name(langId);
                 var $checkbox = $('<input type="checkbox" class="preferred-epg-lang" id="preferred-epg-lang-'+langId+'" value="'+langId+'" />');
@@ -1059,6 +1058,49 @@ $('#preferred-epg-languages-popup .ok').click(function() {
 
 $("#btn_change_preferred_epg_languages").on("click", function() {
     open_preferred_epg_languages_popup();
+});
+
+function update_logos_count() {
+    sendRequest({
+        method: 'get_logos_info',
+        },
+        // onsuccess
+        function(response) {
+            // for testing
+            console.log(response);
+            $('.logos-count').html(response.count_logos);
+        },
+        // onerror
+        function() {}
+        );
+}
+
+$('#btn_remove_all_logos').on('click', function() {
+    if(!window.confirm(__('confirm-remove-all-logos'))) {
+        return false;
+    }
+    sendRequest({
+        method: 'remove_all_logos',
+        },
+        // onsuccess
+        function(response) {
+            update_logos_count();
+        },
+        // onerror
+        function() {}
+        );
+});
+
+$('#btn-upload-logos').on('click', function(e) {
+    e.preventDefault();
+    var file = $("#upload-logos-file").val() || "";
+    if(file.length == 0) {
+        alert('Please select file')
+        return;
+    }
+    // post form
+    backgroundTaskSuppressErrors = true;
+    $("#logos-upload-form").submit();
 });
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -1367,7 +1409,7 @@ $('#content-id-popup .popup3-close').click(function() {
 // Init plugins
 
 $("#sub-header").sticky({topSpacing:0});
-$("#tabs").tabs();
+$("#tabs").tabs().show();
 $("#share-popup .tabs").tabs();
 
 // navigation
@@ -1448,6 +1490,7 @@ if(load_default_page) {
 }
 
 update_active_quick_nav();
+update_logos_count();
 
 //
 $.ajax({

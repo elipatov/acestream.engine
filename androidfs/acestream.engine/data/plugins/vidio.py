@@ -1,55 +1,81 @@
-#-plugin-sig:VcwPXA7D8PG1uEPJOXNUtjv84y31sCbPl+nNUTZIrX24Vynzcn1xnfOS6kpiOa4DLUR7Q3YJLM64MLJdH1ZVF3px+vDPAUNfE7sVhADwUP39/RBsNzl9GwB8B4xkrnNAnulRxYawKGn8SJu0eTA1Y5RRy3oRHEW9G8hqOInp9qe8k6Sm4mcb+2k5IoxBXaxJvQwmZb95td+iq8lorZXH/bx8HXomm1lBiBUxx9HgBsFgP7PNghW8VOAP6Uzuu+O3LGfLgj1v2c6k0YMxx70zMu7KGRFcXsebCk4IwT+ZRpKRvDHt1/J9JMjBYt6VwwhQtVFaKBPEiRECMKZuWuu5Rg==
+#-plugin-sig:bAyn+uPiuPk3nEJhqhzRQRqXDF+3IK0x6oblBSgxD7qdlq1LdTmd+AVdJis9VeKqcC0az7HUbD7V5mpk6SHprZRCMyILt3QDa2v7HK+1FUzEGD4prAPNhLhuw9SNlAoTQaQStObQaoejxp/NHheRezBjNmtIZvTlMl3S0/jjSZan6u5HJoD7HRHX+9hEUxVUWJt+qjIxGX5vexUHHbTWC13yxraMeCR8uxBimEEXJPg6nX1IgE2DUvtqKdzpdNFmZihvEd1vqMOo3aGdbIIjeVYfLS8UTvS2IedAj7qBFUtXkOA+93iyiUHfbJLUE3YMGuwJPDA4XqZbog484WVBvQ==
+"""
+$description Indonesian & international live TV channels and video on-demand service. OTT service from Vidio.
+$url vidio.com
+$type live, vod
+"""
+import logging
 import re
+from urllib.parse import urlsplit, urlunsplit
 
-from ACEStream.PluginsContainer.livestreamer.plugin import Plugin
-from ACEStream.PluginsContainer.livestreamer.plugin.api import http, validate
-from ACEStream.PluginsContainer.livestreamer.plugin.api.utils import parse_json
-from ACEStream.PluginsContainer.livestreamer.stream import HLSStream
+from streamlink.plugin import Plugin, pluginmatcher
+from streamlink.plugin.api import validate
+from streamlink.stream.dash import DASHStream
+from streamlink.stream.hls import HLSStream
 
-try:
-    from HTMLParser import HTMLParser
-except ImportError:
-    from html.parser import HTMLParser
 
-def html_unescape(s):
-    parser = HTMLParser()
-    return parser.unescape(s)
+log = logging.getLogger(__name__)
 
-_url_re = re.compile(r"https?://(?:www\.)?vidio\.com/(?P<type>live|watch)/(?P<id>\d+)-(?P<name>[^/?#&]+)")
-_clipdata_re = re.compile(r"""data-json-clips\s*=\s*(['"])(.*?)\1""")
 
-_schema = validate.Schema(
-    validate.transform(_clipdata_re.search),
-    validate.any(
-        None, 
-        validate.all(
-            validate.get(2),
-            validate.transform(html_unescape),
-            validate.transform(parse_json),
-            [{
-                "sources": [{
-                    "file": validate.url(
-                        scheme="http",
-                        path=validate.endswith(".m3u8")
-                    )
-                }]
-            }]
-        )
-    )
-)
-
+@pluginmatcher(re.compile(
+    r"https?://(?:www\.)?vidio\.com/",
+))
 class Vidio(Plugin):
-    @classmethod
-    def can_handle_url(cls, url):
-        return _url_re.match(url)
+    tokens_url = "https://www.vidio.com/live/{id}/tokens"
+
+    def _get_stream_token(self, stream_id, stream_type):
+        log.debug("Getting stream token")
+        return self.session.http.post(
+            self.tokens_url.format(id=stream_id),
+            params={"type": stream_type},
+            headers={"Referer": self.url},
+            schema=validate.Schema(
+                validate.parse_json(),
+                {"token": str},
+                validate.get("token"),
+            ),
+        )
 
     def _get_streams(self):
-        clips = http.get(self.url, schema=_schema)
-        if not clips:
+        stream_id, has_token, hls_url, dash_url = self.session.http.get(
+            self.url,
+            schema=validate.Schema(
+                validate.parse_html(),
+                validate.xml_find(".//*[@data-video-id]"),
+                validate.union((
+                    validate.get("data-video-id"),
+                    validate.all(
+                        validate.get("data-video-has-token"),
+                        validate.transform(lambda val: val and val != "false"),
+                    ),
+                    validate.get("data-vjs-clip-hls-url"),
+                    validate.get("data-vjs-clip-dash-url"),
+                )),
+            ),
+        )
+
+        if dash_url and has_token:
+            token = self._get_stream_token(stream_id, "dash")
+            parsed = urlsplit(dash_url)
+            dash_url = urlunsplit(parsed._replace(path=f"{token}{parsed.path}"))
+            return DASHStream.parse_manifest(
+                self.session,
+                dash_url,
+                headers={"Referer": "https://www.vidio.com/"},
+            )
+
+        if not hls_url:
             return
 
-        for clip in clips:
-            for source in clip["sources"]:
-                return HLSStream.parse_variant_playlist(self.session, source["file"])
+        if has_token:
+            token = self._get_stream_token(stream_id, "hls")
+            hls_url = f"{hls_url}?{token}"
+
+        return HLSStream.parse_variant_playlist(
+            self.session,
+            hls_url,
+            headers={"Referer": "https://www.vidio.com/"},
+        )
+
 
 __plugin__ = Vidio

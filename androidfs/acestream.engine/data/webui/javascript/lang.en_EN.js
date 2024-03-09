@@ -278,4 +278,13 @@ _LANG['en_EN'] = {
     'select-one-of-these-variants': 'Select one of these variants',
     'login': 'Login',
     'password': 'Pasword',
+    'channel-logos': 'Channel logos',
+    'uploaded-logos': 'Uploaded logos',
+    'upload-channel-logos-zip': 'Upload channel logos (.zip)',
+    'remove-all': 'Remove all',
+    'remove-all-logos': 'Remove all logos',
+    'confirm-remove-all-logos': 'All logos will be deleted. Are you sure?',
+    'add-custom-logo': 'Add custom logo',
+    'logo-url': 'Logo URL',
+    'select-logo-file': 'Select logo file',
 };

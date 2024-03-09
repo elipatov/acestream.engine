@@ -1,75 +1,204 @@
-#!/usr/bin/env python
-#-plugin-sig:mxYy94/pgQILWYl0Z6/uqCbueL0WxSeCBWE9ScnuQ0+4HyyrABXPScvaQMIU0Ittdlo3Aj7Py0XpnlBvjiBULmFk6bYbIiOD9XIC0anFcvMX7ZYdi8RyyUfc9hF3ZLrqyzB7jyrn8+xxJiHRdsHNCzE3BgKcGnzY1PfhgMKkZTk0idHuXA5859VS0FnktasDe7GdcB0M+koDalsHJPKeUavzLzWbnlo10HXOwlgk2dhA+YE2alI7z3T73T9Z156QK6COYvwX1Zx7ykbVB57qSqOTobszxh6FmA+ENXCg1+EMIv3755vqFu3QMTZ53jPKkcDiu0KNOA7UlecktQk4fw==
+#-plugin-sig:MaDFA0ROGfIHaofJYZOt2fhaoecYH8UX/zVsIxS5gkq1zCWVW7t7oDY6Ki8YqxebnLQKNDYtHKeNgHE96B57wA58W2ARfo6xuER6LEaDZHaVIzR++EEa4iQzaB9jeLrpu1mb/2pYyE22lUq4vAfcY+ChgHFK17ZC2inb3VAVXms6pVKnjaBmILlwSAZcItB9cPuiTAAseII8+CdDUn8K9aRovfAyJShNdWNL6CLKR5o6qj1VQXzH/dQgFHvpYSyOfYoq/IQldicmTGUjhFabGeGQG9jSlUcTL421gcxM4kc97qv2zSiykPrTlB8ZhVPqAcGbo9hWHH2bTPYDkxavJg==
+"""
+$description American live TV channel and video on-demand service owned by Warner Bros.
+$url adultswim.com
+$type live, vod
+$region various
+$notes VODs may be protected by DRM
+"""
+
+import logging
 import re
-from pprint import pprint
+from urllib.parse import urlparse, urlunparse
 
-from ACEStream.PluginsContainer.livestreamer.plugin import Plugin
-from ACEStream.PluginsContainer.livestreamer.plugin.api import http, validate
-from ACEStream.PluginsContainer.livestreamer.stream import HLSStream
-from ACEStream.PluginsContainer.livestreamer.utils import parse_json
+from streamlink.plugin import Plugin, PluginError, pluginmatcher
+from streamlink.plugin.api import validate
+from streamlink.stream.hls import HLSStream
+from streamlink.utils.parse import parse_json
 
 
+log = logging.getLogger(__name__)
+
+
+@pluginmatcher(re.compile(r"""
+    https?://(?:www\.)?adultswim\.com
+    /(streams|videos)
+    (?:/([^/]+))?
+    (?:/([^/]+))?
+""", re.VERBOSE))
 class AdultSwim(Plugin):
-    _user_agent = (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_10_3) AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/43.0.2357.65 Safari/537.36")
-    API_URL = "http://www.adultswim.com/videos/api/v2/videos/{id}?fields=stream"
+    token_url = "https://token.ngtv.io/token/token_spe"
+    video_data_url = "https://www.adultswim.com/api/shows/v1/media/{0}/desktop"
 
-    _url_re = re.compile(r"http://www\.adultswim\.com/videos/streams/(.*)")
-    _stream_data_re = re.compile(r".*AS_INITIAL_DATA = (\{.*?});.*", re.M | re.DOTALL)
+    app_id_js_url_re = re.compile(
+        r"""<script src="([^"]*asvp\..*?\.bundle\.js)">""",
+    )
 
-    _page_data_schema = validate.Schema({
-        u"streams": {
-            validate.text: {
-                u"stream": validate.text
-            }
-        }
-    })
+    app_id_re = re.compile(
+        r'''CDN_TOKEN_APP_ID="(.*?)"''',
+    )
+
+    json_data_re = re.compile(
+        r"""<script id="__NEXT_DATA__" type="application/json">({.*})</script>""",
+    )
+
+    truncate_url_re = re.compile(r"""(.*)/\w+/?""")
 
     _api_schema = validate.Schema({
-        u'status': u'ok',
-        u'data': {
-            u'stream': {
-                u'assets': [
-                    {
-                        u'url': validate.url()
-                    }
-                ]
-            }
-        }
-    })
+        "media": {
+            "desktop": {
+                str: {
+                    "url": validate.url(),
+                },
+            },
+        }},
+        validate.get("media"),
+        validate.get("desktop"),
+        validate.filter(lambda k, v: k in ["unprotected", "bulkaes"]),
+    )
 
-    @classmethod
-    def can_handle_url(cls, url):
-        match = AdultSwim._url_re.match(url)
-        return match is not None
+    _stream_data_schema = validate.Schema({
+        "props": {"__REDUX_STATE__": {"streams": [{
+            "id": str,
+            "stream": str,
+        }]}}},
+        validate.get("props"),
+        validate.get("__REDUX_STATE__"),
+        validate.get("streams"),
+    )
+
+    _token_schema = validate.Schema(
+        validate.any(
+            {"auth": {"token": str}},
+            {"auth": {"error": {"message": str}}},
+        ),
+        validate.get("auth"),
+    )
+
+    _video_data_schema = validate.Schema({
+        "props": {"pageProps": {"__APOLLO_STATE__": {
+            str: {
+                validate.optional("id"): str,
+                validate.optional("slug"): str,
+            },
+        }}}},
+        validate.get("props"),
+        validate.get("pageProps"),
+        validate.get("__APOLLO_STATE__"),
+        validate.filter(lambda k, v: k.startswith("Video:")),
+    )
+
+    def _get_stream_data(self, streamid):
+        res = self.session.http.get(self.url)
+        m = self.json_data_re.search(res.text)
+        if m and m.group(1):
+            streams = parse_json(m.group(1), schema=self._stream_data_schema)
+        else:
+            raise PluginError("Failed to get json_data")
+
+        for stream in streams:
+            if "id" in stream and streamid == stream["id"] and "stream" in stream:
+                return stream["stream"]
+
+    def _get_video_data(self, slug):
+        m = self.truncate_url_re.search(self.url)
+        if m and m.group(1):
+            log.debug("Truncated URL={0}".format(m.group(1)))
+        else:
+            raise PluginError("Failed to truncate URL")
+
+        res = self.session.http.get(m.group(1))
+        m = self.json_data_re.search(res.text)
+        if m and m.group(1):
+            videos = parse_json(m.group(1), schema=self._video_data_schema)
+        else:
+            raise PluginError("Failed to get json_data")
+
+        for video in videos:
+            if "slug" in videos[video]:
+                if slug == videos[video]["slug"] and "id" in videos[video]:
+                    return videos[video]["id"]
+
+    def _get_token(self, path):
+        res = self.session.http.get(self.url)
+        m = self.app_id_js_url_re.search(res.text)
+        app_id_js_url = m and m.group(1)
+        if not app_id_js_url:
+            raise PluginError("Could not determine app_id_js_url")
+        log.debug("app_id_js_url={0}".format(app_id_js_url))
+
+        res = self.session.http.get(app_id_js_url)
+        m = self.app_id_re.search(res.text)
+        app_id = m and m.group(1)
+        if not app_id:
+            raise PluginError("Could not determine app_id")
+        log.debug("app_id={0}".format(app_id))
+
+        res = self.session.http.get(self.token_url, params=dict(
+            format="json",
+            appId=app_id,
+            path=path,
+        ))
+
+        token_data = self.session.http.json(res, schema=self._token_schema)
+        if "error" in token_data:
+            raise PluginError(token_data["error"]["message"])
+
+        return token_data["token"]
 
     def _get_streams(self):
-        # get the page
-        res = http.get(self.url, headers={"User-Agent": self._user_agent})
-        # find the big blob of stream info in the page
-        stream_data = self._stream_data_re.match(res.text)
-        stream_name = AdultSwim._url_re.match(self.url).group(1) or "live-stream"
+        url_type, show_name, episode_name = self.match.groups()
 
-        if stream_data:
-            # parse the stream info as json
-            stream_info = parse_json(stream_data.group(1), schema=self._page_data_schema)
-            # get the stream ID
-            stream_id = stream_info[u"streams"][stream_name][u"stream"]
+        if url_type == "streams" and not show_name:
+            url_type = "live-stream"
+        elif not show_name:
+            raise PluginError("Missing show_name for url_type: {0}".format(
+                url_type,
+            ))
 
-            if stream_id:
-                api_url = self.API_URL.format(id=stream_id)
+        log.debug("URL type={0}".format(url_type))
 
-                res = http.get(api_url, headers={"User-Agent": self._user_agent})
-                stream_data = http.json(res, schema=self._api_schema)
-
-                for asset in stream_data[u'data'][u'stream'][u'assets']:
-                    for n, s in HLSStream.parse_variant_playlist(self.session, asset[u"url"]).items():
-                        yield n, s
-
-            else:
-                self.logger.error("Couldn't find the stream ID for this stream: {}".format(stream_name))
+        if url_type == "live-stream":
+            video_id = self._get_stream_data(url_type)
+        elif url_type == "streams":
+            video_id = self._get_stream_data(show_name)
+        elif url_type == "videos":
+            if show_name is None or episode_name is None:
+                raise PluginError(
+                    "Missing show_name or episode_name for url_type: {0}".format(
+                        url_type,
+                    ),
+                )
+            video_id = self._get_video_data(episode_name)
         else:
-            self.logger.error("Couldn't find the stream data for this stream: {}".format(stream_name))
+            raise PluginError("Unrecognised url_type: {0}".format(url_type))
+
+        if video_id is None:
+            raise PluginError("Could not find video_id")
+        log.debug("Video ID={0}".format(video_id))
+
+        res = self.session.http.get(self.video_data_url.format(video_id))
+
+        url_data = self.session.http.json(res, schema=self._api_schema)
+        if "unprotected" in url_data:
+            url = url_data["unprotected"]["url"]
+        elif "bulkaes" in url_data:
+            url_parsed = urlparse(url_data["bulkaes"]["url"])
+            token = self._get_token(url_parsed.path)
+            url = urlunparse((
+                url_parsed.scheme,
+                url_parsed.netloc,
+                url_parsed.path,
+                url_parsed.params,
+                "{0}={1}".format("hdnts", token),
+                url_parsed.fragment,
+            ))
+        else:
+            raise PluginError("Could not find a usable URL in url_data")
+
+        log.debug("URL={0}".format(url))
+
+        return HLSStream.parse_variant_playlist(self.session, url)
+
 
 __plugin__ = AdultSwim

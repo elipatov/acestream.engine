@@ -1,141 +1,64 @@
-#-plugin-sig:Suw7l7vTjUSMPXmr1c9GirXi0mtK6Jod7mw7hReHNit+SO2f+knKNrW3W0cgzgH3uoRPN3Lncwkrj0LaubwchGqnmtEzQpFCW450Ylj7KD9qgrIF0y5AZkCkCHEtCZ18+HKZbktUTJqtZQF3d7nwd4LdHarFHTzruOdslFDvO7W5BZMq4XHrifEvLj/wMN3sRLKCXsnmaSACmqHSfioaueWaTRvL3eBrx1JDrRTIlouHfg7m/XeJc8UwNmCUPLYdMIC9f+hJdstsuHJd2M3rHRIXlyBgYmcfaFvFwSLm73WpwHplPRraCFaX7B0srczZCM/+f2HyQYWlsEMKIyodOw==
-"""Plugin for Denmark's public service channel DR (Danmarks Radio)."""
+#-plugin-sig:ncYfErrC4as7WDSFQ6H+OmdNZu7WpNTHYIXZnyKyqzyYgbj4omBIAxdxcAf3y2n3YDTKpgyyd8xwCN251h+y5mrMuuESJYiWuXJiaq57ADW1+v3Qlocc7F/G1JwZ6ddvfmaLMGJ6rIkaG1TI/E5cYfa4TjWimKd/Qm0gNCXBaLhiumQDAlV5fKZB7fObhjC57yWdQ7QUCMzz/dJzSINATNH0pb/K+weL3emxpFHNSDzXNjZBX85J/pQmPum3s+UB4ac1eJ31QCnVkWzZjX6RV92jAG2DYzldyA/KcLAaflKEZCGA64zodmetA7adN7qndh3UD+bT8Nyrkkui8cTDZw==
+"""
+$description Live TV channels from DR, a Danish public, state-owned broadcaster.
+$url dr.dk
+$type live
+$region Denmark
+"""
 
+import logging
 import re
 
-from ACEStream.PluginsContainer.livestreamer.plugin import Plugin
-from ACEStream.PluginsContainer.livestreamer.plugin.api import http, validate
-from ACEStream.PluginsContainer.livestreamer.stream import HLSStream, HDSStream
-
-LIVE_CHANNELS_API_URL = "http://www.dr.dk/tv/external/channels?mediaType=tv"
-VOD_API_URL = "http://www.dr.dk/mu/programcard/expanded/{0}"
-
-STREAMING_TYPES = {
-    "HDS": HDSStream.parse_manifest,
-    "HLS": HLSStream.parse_variant_playlist
-}
-
-_url_re = re.compile(r"""
-    http(s)?://(www\.)?dr.dk
-    (?:
-        /[TtVv]+/
-        (?:
-            live/(?P<channel>[^/]+)
-        )?
-        (?:
-            se/(.+/)?(?P<program>[^/&?]+)
-        )?
-    )
-""", re.VERBOSE)
-
-_channels_schema = validate.Schema(
-    {
-        "Data": [{
-            "Slug": validate.text,
-            "StreamingServers": validate.all(
-                [{
-                    "LinkType": validate.text,
-                    "Qualities": [
-                        validate.all(
-                            {
-                                "Streams": validate.all(
-                                    [
-                                        validate.all(
-                                            {"Stream": validate.text},
-                                            validate.get("Stream")
-                                        )
-                                    ],
-                                    validate.get(0)
-                                )
-                            },
-                            validate.get("Streams")
-                        )
-                    ],
-                    "Server": validate.text
-                }],
-                validate.filter(lambda s: s["LinkType"] in STREAMING_TYPES)
-            )
-        }]
-    },
-    validate.get("Data", {})
-)
-
-_video_schema = validate.Schema(
-    { "Data": [{
-        "Assets": validate.all(
-            [{ validate.optional("Links"): validate.all(
-                [{
-                    "Target": validate.text,
-                    "Uri": validate.text
-                }],
-                validate.filter(lambda l: l["Target"] in STREAMING_TYPES)
-            )}],
-            validate.filter(lambda a: "Links" in a)
-        )
-    }]},
-    validate.get("Data", {}),
-    validate.get(0, {}),
-    validate.get("Assets", {}),
-    validate.get(0, {}),
-    validate.get("Links", []),
-)
+from streamlink.plugin import Plugin, pluginmatcher
+from streamlink.plugin.api import validate
+from streamlink.stream.hls import HLSStream
 
 
+log = logging.getLogger(__name__)
+
+
+@pluginmatcher(re.compile(
+    r"https?://(?:www\.)?dr\.dk/drtv(/kanal/[\w-]+)",
+))
 class DRDK(Plugin):
-    @classmethod
-    def can_handle_url(cls, url):
-        return _url_re.match(url)
+    live_api_url = "https://www.dr-massive.com/api/page"
+
+    _live_data_schema = validate.Schema(
+        {"item": {"customFields": {
+            validate.optional("hlsURL"): validate.url(),
+            validate.optional("hlsWithSubtitlesURL"): validate.url(),
+        }}},
+        validate.get("item"),
+        validate.get("customFields"),
+    )
+
+    def _get_live(self, path):
+        params = dict(
+            ff="idp",
+            path=path,
+        )
+        res = self.session.http.get(self.live_api_url, params=params)
+        playlists = self.session.http.json(res, schema=self._live_data_schema)
+
+        streams = {}
+        for name, url in playlists.items():
+            name_prefix = ""
+            if name == "hlsWithSubtitlesURL":
+                name_prefix = "subtitled_"
+
+            streams.update(HLSStream.parse_variant_playlist(
+                self.session,
+                url,
+                name_prefix=name_prefix,
+            ))
+
+        return streams
 
     def _get_streams(self):
-        match = _url_re.match(self.url)
-        if not match:
-            return
+        path = self.match.group(1)
+        log.debug("Path={0}".format(path))
 
-        if match.group("channel"):
-            return self._get_live_streams(match.group("channel"))
-        else:
-            return self._get_vod_streams(match.group("program"))
+        return self._get_live(path)
 
-    def _get_vod_streams(self, program):
-        res = http.get(VOD_API_URL.format(program))
-        video = http.json(res, schema=_video_schema)
-
-        streams = {}
-        for link in video:
-            type = link["Target"]
-            url = link["Uri"]
-            parser = STREAMING_TYPES[type]
-
-            try:
-                streams.update(parser(self.session, url))
-            except IOError as err:
-                self.logger.error("Failed to load {0} streams: {1}", type, err)
-
-        return streams
-
-    def _get_live_streams(self, slug):
-        res = http.get(LIVE_CHANNELS_API_URL)
-        res = http.json(res, schema=_channels_schema)
-
-        for channel in filter(lambda c: c["Slug"] == slug, res):
-            servers = channel["StreamingServers"]
-            return self._parse_streaming_servers(servers)
-
-    def _parse_streaming_servers(self, servers):
-        streams = {}
-        for server in servers:
-            type = server["LinkType"]
-            base_url = server["Server"]
-            qualities = server["Qualities"]
-            parser = STREAMING_TYPES[type]
-
-            for quality in qualities:
-                try:
-                    url = "{0}/{1}".format(base_url, quality)
-                    streams.update(parser(self.session, url))
-                except IOError as err:
-                    self.logger.error("Failed to load {0} streams: {1}", type, err)
-
-        return streams
 
 __plugin__ = DRDK

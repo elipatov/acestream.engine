@@ -1,201 +1,134 @@
-#-plugin-sig:gZ42BWEUKe8KiTsQdQN6pgWF/jtAGt3suJ1rsrLUbNcS/Rmx6V38lqnzV3JWNPoLKExwtcNjfL3Ms40jvS5p2nB/vwW3e7MRUEsCZIj7T/gMXibiPNAeDYm0Er4g+Lt7J17e6VINrFsYhTVBm14JJOLsO/QH6I+sxJz2N9sT1gCfRChyUXdjssgZWFXf75qJsFsH1/bbmq05VznEqmGPHfX+XRkysCIsVM13/LlX7WSfKnwyrBOhqPBQbW4UfPJzDWpHmCMWye072Cj/y53zt6TgloVBNdKB9y19r0GguRLtjgFmGW8+jJ9ync+ct668n4Eqfl+feqYqNKm1ll2qtw==
+#-plugin-sig:QwsGP04Z1aMcV8pMN1lFFhfToia/rxrTmPCEhEoo65KnkLjaH5/7mSkj5Qn3ia8ZWaF72YjWZDFWt2cKUhtlXH4bFme/TeKUvQaaEh4KgfBFAqT1n5aOQJ7DROVYzZS8+WXC3OFPukaZdOb5H9wrzRkpAZpNNt4XAwRXc78qhDlkeNXsVWnh3rFRuEdwqCtfhCt8xLGl0UI1YotU6vHr4D4n0QYrVT4mn67Pt/UZOfdFiuaLAOSTh7roU6yQuesxXFxEs0ytS5ex3IG9sEvT8INMBGKAVBbe9Fd8elUaVuta5UffwZSV+KdMWIy245lZtbYpuAJTjZLodkVdKXX56Q==
+"""
+$description Global live-streaming and video on-demand hosting platform.
+$url dailymotion.com
+$type live, vod
+"""
+
+import logging
 import re
 
-from functools import reduce
+from streamlink.plugin import Plugin, pluginmatcher
+from streamlink.plugin.api import validate
+from streamlink.stream.hls import HLSStream
+from streamlink.stream.http import HTTPStream
 
-from ACEStream.PluginsContainer.livestreamer.compat import urlparse, range
-from ACEStream.PluginsContainer.livestreamer.plugin import Plugin
-from ACEStream.PluginsContainer.livestreamer.plugin.api import http, validate
-from ACEStream.PluginsContainer.livestreamer.stream import HDSStream, HLSStream, HTTPStream, RTMPStream
-from ACEStream.PluginsContainer.livestreamer.stream.playlist import FLVPlaylist
 
-COOKIES = {
-    "family_filter": "off",
-    "ff": "off"
-}
-QUALITY_MAP = {
-    "ld": "240p",
-    "sd": "360p",
-    "hq": "480p",
-    "hd720": "720p",
-    "hd1080": "1080p",
-    "custom": "live",
-    "auto": "hds",
-    "source": "hds"
-}
-STREAM_INFO_URL = "http://www.dailymotion.com/sequence/full/{0}"
+log = logging.getLogger(__name__)
 
-_rtmp_re = re.compile("""
-    (?P<host>rtmp://[^/]+)
-    /(?P<app>[^/]+)
-    /(?P<playpath>.+)
-""", re.VERBOSE)
-_url_re = re.compile("""
-    http(s)?://(\w+\.)?
-    dailymotion.com
-    (/embed)?/(video|live)
-    /(?P<media_id>[^_?/]+)
-""", re.VERBOSE)
 
-_media_inner_schema = validate.Schema([{
-    "layerList": [{
-        "name": validate.text,
-        validate.optional("sequenceList"): [{
-            "layerList": validate.all(
-                [{
-                    "name": validate.text,
-                    validate.optional("param"): dict
-                }],
-                validate.filter(lambda l: l["name"] in ("video", "reporting"))
-            )
-        }]
-    }]
-}])
-_media_schema = validate.Schema(
-    validate.any(
-        _media_inner_schema,
-        validate.all(
-            {"sequence": _media_inner_schema},
-            validate.get("sequence")
-        )
+@pluginmatcher(re.compile(r"""
+    https?://(?:\w+\.)?dailymotion\.com
+    (?:
+        (/embed)?/(video|live)/(?P<media_id>[^_?/]+)
+        |
+        /(?P<user>[\w-]+)
     )
-)
-_vod_playlist_schema = validate.Schema({
-    "duration": float,
-    "fragments": [[int, float]],
-    "template": validate.text
-})
-_vod_manifest_schema = validate.Schema({
-    "alternates": [{
-        "height": int,
-        "template": validate.text,
-        validate.optional("failover"): [validate.text]
-    }]
-})
-
-
+""", re.VERBOSE))
 class DailyMotion(Plugin):
-    @classmethod
-    def can_handle_url(self, url):
-        return _url_re.match(url)
+    _URL_API_USER_VIDEO = "https://api.dailymotion.com/user/{user}/videos"
+    _URL_STREAM_INFO = "https://www.dailymotion.com/player/metadata/video/{media_id}"
 
     def _get_streams_from_media(self, media_id):
-        res = http.get(STREAM_INFO_URL.format(media_id), cookies=COOKIES)
-        media = http.json(res, schema=_media_schema)
-
-        params = extra_params = swf_url = None
-        for __ in media:
-            for __ in __["layerList"]:
-                for __ in __.get("sequenceList", []):
-                    for layer in __["layerList"]:
-                        name = layer["name"]
-                        if name == "video":
-                            params = layer.get("param")
-                        elif name == "reporting":
-                            extra_params = layer.get("param", {})
-                            extra_params = extra_params.get("extraParams", {})
-
-        if not params:
-            return
-
-        if extra_params:
-            swf_url = extra_params.get("videoSwfURL")
-
-        mode = params.get("mode")
-        if mode == "live":
-            return self._get_live_streams(params, swf_url)
-        elif mode == "vod":
-            return self._get_vod_streams(params)
-
-    def _get_live_streams(self, params, swf_url):
-        for key, quality in QUALITY_MAP.items():
-            key_url = "{0}URL".format(key)
-            url = params.get(key_url)
-
-            if not url:
-                continue
-
-            try:
-                res = http.get(url, exception=IOError)
-            except IOError:
-                continue
-
-            if quality == "hds":
-                streams = HDSStream.parse_manifest(self.session, res.url)
-                for name, stream in streams.items():
-                    if key == "source":
-                        name += "+"
-
-                    yield name, stream
-            elif res.text.startswith("rtmp"):
-                match = _rtmp_re.match(res.text)
-                if not match:
-                    continue
-
-                stream = RTMPStream(self.session, {
-                    "rtmp": match.group("host"),
-                    "app": match.group("app"),
-                    "playpath": match.group("playpath"),
-                    "swfVfy": swf_url,
-                    "live": True
-                })
-
-                yield quality, stream
-
-    def _create_flv_playlist(self, template):
-        res = http.get(template)
-        playlist = http.json(res, schema=_vod_playlist_schema)
-
-        parsed = urlparse(template)
-        url_template = "{0}://{1}{2}".format(
-            parsed.scheme, parsed.netloc, playlist["template"]
+        media = self.session.http.get(
+            self._URL_STREAM_INFO.format(media_id=media_id),
+            cookies={
+                "family_filter": "off",
+                "ff": "off",
+            },
+            schema=validate.Schema(
+                validate.parse_json(),
+                validate.any(
+                    {
+                        "error": {"type": "not_found"},
+                    },
+                    {
+                        "error": {"title": str},
+                    },
+                    {
+                        "owner": {
+                            "username": str,
+                        },
+                        "title": str,
+                        "qualities": {
+                            str: [{
+                                "type": str,
+                                "url": validate.url(),
+                            }],
+                        },
+                    },
+                ),
+            ),
         )
-        segment_max = reduce(lambda i,j: i + j[0], playlist["fragments"], 0)
 
-        substreams = [HTTPStream(self.session,
-                                 url_template.replace("$fragment$", str(i)))
-                      for i in range(1, segment_max + 1)]
-
-        return FLVPlaylist(self.session,
-                           duration=playlist["duration"],
-                           flatten_timestamps=True,
-                           skip_header=True,
-                           streams=substreams)
-
-    def _get_vod_streams(self, params):
-        manifest_url = params.get("autoURL")
-        if not manifest_url:
+        error = media.get("error")
+        if error:
+            if error.get("type") == "not_found":
+                log.error(f"Unknown media ID: {media_id}")
+            else:
+                log.error(f"Failed to get stream: {error['title']}")
             return
 
-        res = http.get(manifest_url)
-        if res.headers.get("Content-Type") == "application/f4m+xml":
-            streams = HDSStream.parse_manifest(self.session, res.url)
+        self.id = media_id
+        self.author = media["owner"]["username"]
+        self.title = media["title"]
 
-            # TODO: Replace with "yield from" when dropping Python 2.
-            for __ in streams.items():
-                yield __
-        elif res.headers.get("Content-Type") == "application/vnd.apple.mpegurl":
-            streams = HLSStream.parse_variant_playlist(self.session, res.url)
+        for quality, streams in media["qualities"].items():
+            for stream in streams:
+                if stream["type"] == "application/x-mpegURL":
+                    if quality != "auto":
+                        # Avoid duplicate HLS streams with bitrate selector in the URL query
+                        continue
+                    yield from HLSStream.parse_variant_playlist(self.session, stream["url"]).items()
+                elif stream["type"] == "video/mp4":
+                    # Drop FPS in quality
+                    quality = re.sub(r"@\d+", "", quality)
+                    resolution = f"{quality}p"
+                    yield resolution, HTTPStream(self.session, stream["url"])
 
-            # TODO: Replace with "yield from" when dropping Python 2.
-            for __ in streams.items():
-                yield __
-        else:
-            manifest = http.json(res, schema=_vod_manifest_schema)
-            for params in manifest["alternates"]:
-                name = "{0}p".format(params["height"])
-                stream = self._create_flv_playlist(params["template"])
-                yield name, stream
+    def _get_media_id(self, user):
+        # https://developers.dailymotion.com/tools/
+        data = self.session.http.get(
+            self._URL_API_USER_VIDEO.format(user=user),
+            params={
+                "fields": "id",
+                "flags": "live_onair",
+                "family_filter": "false",
+            },
+            acceptable_status=(200, 404),
+            schema=validate.Schema(
+                validate.parse_json(),
+                validate.any(
+                    {
+                        "error": {"message": str},
+                    },
+                    {
+                        "list": [{"id": str}],
+                    },
+                ),
+            ),
+        )
 
-                failovers = params.get("failover", [])
-                for failover in failovers:
-                    stream = self._create_flv_playlist(failover)
-                    yield name, stream
+        if data.get("error"):
+            log.error(f"Error while retrieving media ID: {data['error']['message']}")
+            return
+
+        if not data["list"]:
+            log.error(f"No live streams found for channel {user}")
+            return
+
+        return data["list"][0]["id"]
 
     def _get_streams(self):
-        match = _url_re.match(self.url)
-        media_id = match.group("media_id")
+        media_id = self.match.group("media_id")
+        user = self.match.group("user")
 
-        return self._get_streams_from_media(media_id)
+        if not media_id and user:
+            media_id = self._get_media_id(user)
+
+        if media_id:
+            log.debug(f"Found media ID: {media_id}")
+            return self._get_streams_from_media(media_id)
+
 
 __plugin__ = DailyMotion

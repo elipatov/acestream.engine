@@ -1,32 +1,54 @@
-#-plugin-sig:HS+goJog/iP/ABVqWuR+SQwwPq4xBPEm7+pycOcsbaIEMQGTUCJx3ugIhBEralDDy07ZMec9AjBAFPIbkWULHYvw4nKJC8o+YA7EArYyCPJIJDE5jkqSe//DNUHfEPAe/IpuFzS1cpoeZNt5WERnizQaXsABZGQVhdlK/gBz1G8h/Y7oYrQ+AfC8n/KE0DQeZuV8uvMuqsVLJCM+e9+pleaM4fr7dOTCB796SDSXpypPKM5Ao8NaRDT/MFDXTW2D76n/f518qna6b5HoIiF0XbsE5CQPvNp9eM5t67kfNCkDmHj7cBZda377sWsUpSGTVTp67PazgtewQZyedM6KPw==
-import hashlib
+#-plugin-sig:S+bh50rCFtBtZuDwe6H+mFjnz6pU6TfV4bqg4llDvQWr9XdCAn1YkdIWBoOG8NaQNa6yvPPkW3l6E105yBgCjXOvxh17+aly4hOTijGMs0hDc2sQRWv+NoPfs/rkLTSUjmDetw+hKm8wZMDk9+S7xJSIIs/fjy30RgI1J57F+kdAgY/9q3Wfwk5SYADvCU1hc+MzzDWo445nTnR252xZFAgZcqUlpUWBvb3d566PqV4xxKrd0i5PNy5TjroJ874o+iEnLqUgCNtOv6SN1fkkFf4/7QD6UxVI7WZxYdfuMj1MtChIjaJMaFq+Dwvn2ytDcgxa2BZvCj8RbGQSHMx7Vw==
+"""
+$description Chinese video sharing website based in Shanghai, themed around animation, comics, and games (ACG).
+$url live.bilibili.com
+$type live
+"""
+
+import logging
 import re
-import time
+from urllib.parse import urlparse
 
-from ACEStream.PluginsContainer.livestreamer.plugin import Plugin
-from ACEStream.PluginsContainer.livestreamer.plugin.api import http, validate
-from ACEStream.PluginsContainer.livestreamer.stream import HTTPStream
+from streamlink.plugin import Plugin, pluginmatcher
+from streamlink.plugin.api import validate
+from streamlink.stream.http import HTTPStream
 
-API_URL = "http://live.bilibili.com/api/playurl?cid={0}&player=1&quality=0&sign={1}&otype=json"
-API_SECRET = "95acd7f6cc3392f3"
+
+log = logging.getLogger(__name__)
+
+API_URL = "https://api.live.bilibili.com/room/v1/Room/playUrl"
+ROOM_API = "https://api.live.bilibili.com/room/v1/Room/room_init?id={}"
+SHOW_STATUS_OFFLINE = 0
 SHOW_STATUS_ONLINE = 1
-SHOW_STATUS_OFFLINE = 2
+SHOW_STATUS_ROUND = 2
 STREAM_WEIGHTS = {
-    "source": 1080
+    "source": 1080,
 }
 
-_url_re = re.compile("""
-    http(s)?://live.bilibili.com
-    /(?P<channel>[^/]+)
-""", re.VERBOSE)
+_room_id_schema = validate.Schema(
+    {
+        "data": validate.any(None, {
+            "room_id": int,
+            "live_status": int,
+        }),
+    },
+    validate.get("data"),
+)
 
-_room_re = re.compile('var ROOMID = (\\d+)')
+_room_stream_list_schema = validate.Schema(
+    {
+        "data": validate.any(None, {
+            "durl": [{"url": validate.url()}],
+        }),
+    },
+    validate.get("data"),
+)
 
+
+@pluginmatcher(re.compile(
+    r"https?://live\.bilibili\.com/(?P<channel>[^/]+)",
+))
 class Bilibili(Plugin):
-    @classmethod
-    def can_handle_url(self, url):
-        return _url_re.match(url)
-
     @classmethod
     def stream_weight(cls, stream):
         if stream in STREAM_WEIGHTS:
@@ -35,24 +57,42 @@ class Bilibili(Plugin):
         return Plugin.stream_weight(stream)
 
     def _get_streams(self):
-        match = _url_re.match(self.url)
-        channel = match.group("channel")
-        
-        html_page = http.get(self.url).content.decode('utf-8')
-        room_id = _room_re.search(html_page).group(1)
-    
-        ts = int(time.time() / 60)
-        sign = hashlib.md5(("{0}{1}".format(channel, API_SECRET, ts)).encode("utf-8")).hexdigest()
+        self.session.http.headers.update({"Referer": self.url})
+        channel = self.match.group("channel")
+        res_room_id = self.session.http.get(ROOM_API.format(channel))
+        room_id_json = self.session.http.json(res_room_id, schema=_room_id_schema)
+        room_id = room_id_json["room_id"]
+        if room_id_json["live_status"] != SHOW_STATUS_ONLINE:
+            return
 
-        res = http.get(API_URL.format(room_id, sign))
-        room = http.json(res)
+        params = {
+            "cid": room_id,
+            "quality": "4",
+            "platform": "web",
+        }
+        res = self.session.http.get(API_URL, params=params)
+        room = self.session.http.json(res, schema=_room_stream_list_schema)
         if not room:
             return
 
         for stream_list in room["durl"]:
             name = "source"
             url = stream_list["url"]
+            # check if the URL is available
+            log.trace("URL={0}".format(url))
+            r = self.session.http.get(url,
+                                      retries=0,
+                                      timeout=3,
+                                      stream=True,
+                                      acceptable_status=(200, 403, 404, 405))
+            p = urlparse(url)
+            if r.status_code != 200:
+                log.error("Netloc: {0} with error {1}".format(p.netloc, r.status_code))
+                continue
+
+            log.debug("Netloc: {0}".format(p.netloc))
             stream = HTTPStream(self.session, url)
             yield name, stream
+
 
 __plugin__ = Bilibili

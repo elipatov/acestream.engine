@@ -1,59 +1,207 @@
-#-plugin-sig:lJ3o+pvffOC3rOmgOu5Ux9WjSydz7kZo4QvD79x/F/dzTuMhZala6Q/2HC+UCTh9C/2+nxIa+XJeI8CmyV+UJD3zz7hXEFeKrAyYREHiGR7Tm5sLQF2UHDGCWa8goHyLyOggGUEtA0E5mUJVRWKQxo3ti9UpEC00zdeBz8j3VMWQTb5UYd7clnRcSsWTFqk5Ofc+JG4x7X/SI6hYiYAfTs8uaR/6qe5kYb4URHpQqCtWM91WrL+wvADg+1ScIsWn8pFP+XgsXPoEguFMdgJTn7COBDvYsx7e7cYMYTfAm8eHiZhMkWOIfVDioz0OJndI6OWOIfv/vo3p276UyA2EBw==
+#-plugin-sig:Y71tCpENCpl3A90Nh2ik8tgqi+2lKtsNLwHOZ60HvrLv+M3JZ/y/K6ovT8smiQmHwdaHJWpkNfQrecBNYxFDFPc6Pw+m7XRU8s6Lx9fy/VMhPoQz5kTZ3EDojGM9gbnDyUriTFRszidUymrA4nnVi9jfcZ8+jC8C67ny0PYcu0GcezLYu6pvvamy8jtrOhuHt9CmpNRXvTTr+Pja8f0W7UTcreiSP2lvBLJnaClTKnCU+4zDB3H+LLO9FT8jYtoCXvwWavqzC5sm2pbNytOn8YO4kXowSOBOU2J/IplfafwR48EX1ImvdFzGFZYd+k3MFOtf/2gLu+sAqdlNAn8x1w==
+"""
+$description Live TV channels and video on-demand service from RTVE, a Spanish public, state-owned broadcaster.
+$url rtve.es
+$type live, vod
+$region Spain
+"""
+
+import logging
 import re
+from base64 import b64decode
+from io import BytesIO
+from typing import Iterator, Sequence, Tuple
+from urllib.parse import urlparse
 
-from ACEStream.PluginsContainer.livestreamer.plugin import Plugin, PluginError
-from ACEStream.PluginsContainer.livestreamer.plugin.api import http
-from ACEStream.PluginsContainer.livestreamer.stream import HLSStream
-
-# The last four channel_paths repsond with 301 and provide
-# a redirect location that corresponds to a channel_path above.
-_url_re = re.compile(r"""
-    https?://www\.rtve\.es/
-    (?P<channel_path>
-        directo/la-1|
-        directo/la-2|
-        directo/teledeporte|
-        directo/canal-24h|
-
-        noticias/directo-la-1|
-        television/la-2-directo|
-        deportes/directo/teledeporte|
-        noticias/directo/canal-24h
-    )
-    /?
-""", re.VERBOSE)
-
-_id_map = {
-    "directo/la-1": "LA1",
-    "directo/la-2": "LA2",
-    "directo/teledeporte": "TDP",
-    "directo/canal-24h": "24H",
-    "noticias/directo-la-1": "LA1",
-    "television/la-2-directo": "LA2",
-    "deportes/directo/teledeporte": "TDP",
-    "noticias/directo/canal-24h": "24H",
-}
+from streamlink.plugin import Plugin, PluginError, pluginmatcher
+from streamlink.plugin.api import validate
+from streamlink.stream.ffmpegmux import MuxedStream
+from streamlink.stream.hls import HLSStream
+from streamlink.stream.http import HTTPStream
+from streamlink.utils.url import update_scheme
 
 
-class Rtve(Plugin):
+log = logging.getLogger(__name__)
+
+
+class Base64Reader:
+    def __init__(self, data: str):
+        stream = BytesIO(b64decode(data))
+
+        def _iterate():
+            while True:
+                chunk = stream.read(1)
+                if len(chunk) == 0:
+                    return
+                yield ord(chunk)
+
+        self._iterator: Iterator[int] = _iterate()
+
+    def read(self, num: int) -> Sequence[int]:
+        res = []
+        for _ in range(num):
+            item = next(self._iterator, None)
+            if item is None:
+                break
+            res.append(item)
+        return res
+
+    def skip(self, num: int) -> None:
+        self.read(num)
+
+    def read_chars(self, num: int) -> str:
+        return "".join(chr(item) for item in self.read(num))
+
+    def read_int(self) -> int:
+        a, b, c, d = self.read(4)
+        return a << 24 | b << 16 | c << 8 | d
+
+    def read_chunk(self) -> Tuple[str, Sequence[int]]:
+        size = self.read_int()
+        chunktype = self.read_chars(4)
+        chunkdata = self.read(size)
+        if len(chunkdata) != size:  # pragma: no cover
+            raise ValueError("Invalid chunk length")
+        self.skip(4)
+        return chunktype, chunkdata
+
+    def __iter__(self):
+        self.skip(8)
+        while True:
+            try:
+                yield self.read_chunk()
+            except ValueError:
+                return
+
+
+class ZTNR:
+    @staticmethod
+    def _get_alphabet(text: str) -> str:
+        res = []
+        j = 0
+        k = 0
+        for char in text:
+            if k > 0:
+                k -= 1
+            else:
+                res.append(char)
+                j = (j + 1) % 4
+                k = j
+        return "".join(res)
+
+    @staticmethod
+    def _get_url(text: str, alphabet: str) -> str:
+        res = []
+        j = 0
+        n = 0
+        k = 3
+        cont = 0
+        for char in text:
+            if j == 0:
+                n = int(char) * 10
+                j = 1
+            elif k > 0:
+                k -= 1
+            else:
+                res.append(alphabet[n + int(char)])
+                j = 0
+                k = cont % 4
+                cont += 1
+        return "".join(res)
+
     @classmethod
-    def can_handle_url(cls, url):
-        return _url_re.match(url)
+    def _get_source(cls, alphabet: str, data: str) -> str:
+        return cls._get_url(data, cls._get_alphabet(alphabet))
 
-    def __init__(self, url):
-        Plugin.__init__(self, url)
-        match = _url_re.match(url).groupdict()
-        self.channel_path = match["channel_path"]
+    @classmethod
+    def translate(cls, data: str) -> Iterator[Tuple[str, str]]:
+        reader = Base64Reader(data.replace("\n", ""))
+        for chunk_type, chunk_data in reader:
+            if chunk_type == "IEND":
+                break
+            if chunk_type == "tEXt":
+                content = "".join(chr(item) for item in chunk_data if item > 0)
+                if "#" not in content or "%%" not in content:
+                    continue
+                alphabet, content = content.split("#", 1)
+                quality, content = content.split("%%", 1)
+                yield quality, cls._get_source(alphabet, content)
+
+
+@pluginmatcher(re.compile(
+    r"https?://(?:www\.)?rtve\.es/play/videos/.+",
+))
+class Rtve(Plugin):
+    URL_M3U8 = "https://ztnr.rtve.es/ztnr/{id}.m3u8"
+    URL_VIDEOS = "https://ztnr.rtve.es/ztnr/movil/thumbnail/rtveplayw/videos/{id}.png?q=v2"
+    URL_SUBTITLES = "https://www.rtve.es/api/videos/{id}/subtitulos.json"
 
     def _get_streams(self):
-        stream_id = _id_map[self.channel_path]
-        hls_url = "http://iphonelive.rtve.es/{0}_LV3_IPH/{0}_LV3_IPH.m3u8".format(stream_id)
+        self.id = self.session.http.get(self.url, schema=validate.Schema(
+            re.compile(r"\bdata-setup='({.+?})'", re.DOTALL),
+            validate.none_or_all(
+                validate.get(1),
+                validate.parse_json(),
+                {
+                    "idAsset": validate.any(int, validate.all(str, validate.transform(int))),
+                },
+                validate.get("idAsset"),
+            ),
+        ))
+        if not self.id:
+            return
 
-        # Check if the stream is available
-        res = http.head(hls_url, raise_for_status=False)
-        if res.status_code == 404:
-            raise PluginError("The program is not available due to rights restrictions")
+        # check obfuscated stream URLs via self.URL_VIDEOS and ZTNR.translate() first
+        # self.URL_M3U8 appears to be valid for all streams, but doesn't provide any content in some cases
+        try:
+            urls = self.session.http.get(
+                self.URL_VIDEOS.format(id=self.id),
+                schema=validate.Schema(
+                    validate.transform(ZTNR.translate),
+                    validate.transform(list),
+                    [(str, validate.url())],
+                    validate.length(1),
+                ),
+            )
+        except PluginError:
+            # catch HTTP errors and validation errors, and fall back to generic HLS URL template
+            url = self.URL_M3U8.format(id=self.id)
+        else:
+            url = next((url for _, url in urls if urlparse(url).path.endswith(".m3u8")), None)
+            if not url:
+                url = next((url for _, url in urls if urlparse(url).path.endswith(".mp4")), None)
+                if url:
+                    yield "vod", HTTPStream(self.session, url)
+                return
 
-        return HLSStream.parse_variant_playlist(self.session, hls_url)
+        streams = HLSStream.parse_variant_playlist(self.session, url).items()
+
+        if self.session.get_option("mux-subtitles"):
+            subs = self.session.http.get(
+                self.URL_SUBTITLES.format(id=self.id),
+                schema=validate.Schema(
+                    validate.parse_json(),
+                    {
+                        "page": {
+                            "items": [{
+                                "lang": str,
+                                "src": validate.url(),
+                            }],
+                        },
+                    },
+                    validate.get(("page", "items")),
+                ),
+            )
+            if subs:
+                subtitles = {
+                    s["lang"]: HTTPStream(self.session, update_scheme("https://", s["src"], force=True))
+                    for s in subs
+                }
+                for quality, stream in streams:
+                    yield quality, MuxedStream(self.session, stream, subtitles=subtitles)
+                return
+
+        yield from streams
+
 
 __plugin__ = Rtve

@@ -1,50 +1,81 @@
-#-plugin-sig:SuxBwt1CtR8NzDKEBZ2blx0jG3SP8OrDbEKQCeIqhe8ftfkPxJRa8V8evJeQjVd/cyswDCqc36ZkHhjKDCmeonTMFyO/Vdzw14TcfYP7milrwj8mqWKXw8gGt6Y3on/nSvRHBaDSqp9HQOU/yLQyEPxEbsqdFm07icSTPWk6A5JuzF4joE44QLV8JhR/m/9HELxnt0uBlnmUBwmFA43jVyEeO8SYijcJgMbv2qSQzWCNsVueQ3W8oaI49hAGHe+dJ9aco9RTZpArRQSzMDU3MAkzDdIR9aVyhSWtT+9jwo3zPgNJvAkQnl6mq0dCbNz60w46MoApYhZtf4PseMu6dA==
+#-plugin-sig:J4BLWMvYVb0E+gdN/GJPE0v6ioOk36f2XAP8aIlI/ahmhIZS4YDefM6zmRvrGMvV9hslJbPD/4WZ0fSaalt4yIRu4AZG40j39/nnzb5oZoaQ2szBtwSp9VmZFAdIGi1eILlpSpTDHZgx7sI/Q01cw7ap49aasUdJK3qRDM4jBkBJHBo0LEu+onrlZOIDgp69l77Qdzxsk440NQIA92ClxO1L2uTxc1lairyaUJ2WuCgEisBo84g0fvst9tgPPKNYLWC1UW765wUn/zbkwlib9izTipGJVUTv9b1iH1a4q02isOJCFVsbWhoq3baxJioPrcBBq5nc1utuXPuxJWSRzA==
+"""
+$description Live TV channels and video on-demand service from ARD, a German public, independent broadcaster.
+$url daserste.de
+$type live, vod
+$region Germany
+"""
+
+import logging
 import re
+from urllib.parse import urljoin
 
-from functools import partial
+from streamlink.plugin import Plugin, PluginError, pluginmatcher
+from streamlink.plugin.api import validate
+from streamlink.stream.hls import HLSStream
+from streamlink.stream.http import HTTPStream
 
-from ACEStream.PluginsContainer.livestreamer.plugin import Plugin
-from ACEStream.PluginsContainer.livestreamer.plugin.api import http, validate
-from ACEStream.PluginsContainer.livestreamer.stream import HLSStream, HDSStream
 
-STREAM_INFO_URL = "http://live.daserste.de/{0}/livestream.xml"
-SWF_URL = "http://live.daserste.de/lib/br-player/swf/main.swf"
-STREAMING_TYPES = {
-    "streamingUrlLive": (
-        "HDS", partial(HDSStream.parse_manifest, pvswf=SWF_URL)
-    ),
-    "streamingUrlIPhone": (
-        "HLS", HLSStream.parse_variant_playlist
-    )
-}
+log = logging.getLogger(__name__)
 
-_url_re = re.compile("http(s)?://live.daserste.de/(?P<channel>[^/?]+)?")
 
-_livestream_schema = validate.Schema(
-    validate.xml_findall("video/*"),
-    validate.filter(lambda e: e.tag in STREAMING_TYPES),
-    validate.map(lambda e: (STREAMING_TYPES.get(e.tag), e.text)),
-    validate.transform(dict),
-)
-
-class ard_live(Plugin):
-    @classmethod
-    def can_handle_url(cls, url):
-        return _url_re.match(url)
+@pluginmatcher(re.compile(
+    r"https?://((www|live)\.)?daserste\.de/",
+))
+class ARDLive(Plugin):
+    _URL_DATA_BASE = "https://www.daserste.de/"
+    _QUALITY_MAP = {
+        4: "1080p",
+        3: "720p",
+        2: "540p",
+        1: "270p",
+        0: "180p",
+    }
 
     def _get_streams(self):
-        match = _url_re.match(self.url)
-        channel = match.group("channel")
-        res = http.get(STREAM_INFO_URL.format(channel))
-        urls = http.xml(res, schema=_livestream_schema)
+        try:
+            data_url = self.session.http.get(self.url, schema=validate.Schema(
+                validate.parse_html(),
+                validate.xml_find(".//*[@data-ctrl-player]"),
+                validate.get("data-ctrl-player"),
+                validate.transform(lambda s: s.replace("'", "\"")),
+                validate.parse_json(),
+                {"url": str},
+                validate.get("url"),
+            ))
+        except PluginError:
+            return
 
-        streams = {}
-        for (name, parser), url in urls.items():
-            try:
-                streams.update(parser(self.session, url))
-            except IOError as err:
-                self.logger.warning("Unable to extract {0} streams: {1}", name, err)
+        data_url = urljoin(self._URL_DATA_BASE, data_url)
+        log.debug(f"Player URL: '{data_url}'")
 
-        return streams
+        self.title, media = self.session.http.get(data_url, schema=validate.Schema(
+            validate.parse_json(name="MEDIAINFO"),
+            {"mc": {
+                validate.optional("_title"): str,
+                "_mediaArray": [validate.all(
+                    {
+                        "_mediaStreamArray": [validate.all(
+                            {
+                                "_quality": validate.any(str, int),
+                                "_stream": [validate.url()],
+                            },
+                            validate.union_get("_quality", ("_stream", 0)),
+                        )],
+                    },
+                    validate.get("_mediaStreamArray"),
+                    validate.transform(dict),
+                )],
+            }},
+            validate.get("mc"),
+            validate.union_get("_title", ("_mediaArray", 0)),
+        ))
 
-__plugin__ = ard_live
+        if media.get("auto"):
+            yield from HLSStream.parse_variant_playlist(self.session, media.get("auto")).items()
+        else:
+            for quality, stream in media.items():
+                yield self._QUALITY_MAP.get(quality, quality), HTTPStream(self.session, stream)
+
+
+__plugin__ = ARDLive

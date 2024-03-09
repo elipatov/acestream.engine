@@ -1,627 +1,558 @@
-#-plugin-sig:M2hZIB4jsltk85NYh78wYRPXgM0EyltzT3a+dG1nw655o1vJnCsCvWKXqNLaVHwBFLwFKgM1aD5m9XUZxHknAgGO9/7bpMaWhfLtggdCkvfFu5tDeiGl/Gw/Iah1n6mFESm10CVknNsIWgJVLfFgenHx3wz+MAiZ21pmqxv0jocwrWN63tE98gUkbedneWkiW8j+uGpSNKKfDQUwCqYGHhI+tNiNH086PA2asKwEA4X9LaZwqjRbZDRHC23N0XfaMb8oYLo056BlSfpRciSmhWn2FjUH52NXV+Yl1rwXsM/Y/yRMxOsk50x9c/WVUBO2WZxAaEk3A3+69pqVYEbzhg==
+#-plugin-sig:Wsecl32Zvii5pfDMGv5HolJDD268VayeLLDlUq+SIsuih+g+wj2WngVWihw4b3oNRuRvA7SEFN9Km4THGh3h+s70GQQ09Js/akXQm+cSyewiWaCrFI1HMEBIt+KVaYnY3Yd9NYraKv9KJ8YJU2H6MwqLSdvoRmOuXJlzgNIgQ7iBtRUBzEg5cUyfhok7xUahjAVVv/BrljSPIV8ibjS/kjfojN3VCJGejRjMmNKl4qgTvrbZT0NEM35aHWmz1KfJryrKr/7G/RfgU05uVEwS7DMDKPNBxAi6rWHZ0DwvjMF3gaXu/vusH8wjdt3dTph6JnrcXz/XxGJQxc6RUAKKzQ==
+"""
+$description Global live-streaming and video on-demand platform owned by IBM.
+$url ustream.tv
+$url video.ibm.com
+$type live, vod
+"""
+
+import logging
 import re
-
-from collections import namedtuple
-from functools import partial
+from collections import deque
+from datetime import datetime, timedelta, timezone
 from random import randint
-from time import sleep
+from threading import Event, RLock
+from typing import Any, Callable, Deque, Dict, List, NamedTuple, Optional, Union
+from urllib.parse import urljoin, urlunparse
 
-from ACEStream.PluginsContainer.livestreamer.compat import urlparse, urljoin, range
-from ACEStream.PluginsContainer.livestreamer.exceptions import StreamError, PluginError, NoStreamsError
-from ACEStream.PluginsContainer.livestreamer.plugin import Plugin, PluginOptions
-from ACEStream.PluginsContainer.livestreamer.plugin.api import http, validate
-from ACEStream.PluginsContainer.livestreamer.stream import RTMPStream, HLSStream, HTTPStream, Stream
-from ACEStream.PluginsContainer.livestreamer.stream.flvconcat import FLVTagConcat
-from ACEStream.PluginsContainer.livestreamer.stream.segmented import (
-    SegmentedStreamReader, SegmentedStreamWriter, SegmentedStreamWorker
-)
+from requests import Response
 
-try:
-    import librtmp
-    HAS_LIBRTMP = True
-except ImportError:
-    HAS_LIBRTMP = False
+from streamlink.exceptions import PluginError, StreamError
+from streamlink.plugin import Plugin, pluginargument, pluginmatcher
+from streamlink.plugin.api import useragents, validate
+from streamlink.plugin.api.websocket import WebsocketClient
+from streamlink.stream.ffmpegmux import MuxedStream
+from streamlink.stream.segmented import SegmentedStreamReader, SegmentedStreamWorker, SegmentedStreamWriter
+from streamlink.stream.stream import Stream
+from streamlink.utils.parse import parse_json
 
-_url_re = re.compile("""
-    http(s)?://(www\.)?ustream.tv
-    (?:
-        (/embed/|/channel/id/)(?P<channel_id>\d+)
-    )?
-    (?:
-        /recorded/(?P<video_id>\d+)
-    )?
-""", re.VERBOSE)
-_channel_id_re = re.compile("\"channelId\":(\d+)")
 
-HLS_PLAYLIST_URL = (
-    "http://iphone-streaming.ustream.tv"
-    "/uhls/{0}/streams/live/iphone/playlist.m3u8"
-)
-RECORDED_URL = "http://tcdn.ustream.tv/video/{0}"
-RTMP_URL = "rtmp://r{0}-1-{1}-channel-live.ums.ustream.tv:1935/ustream"
-SWF_URL = "http://static-cdn1.ustream.tv/swf/live/viewer.rsl:505.swf"
+log = logging.getLogger(__name__)
 
-_module_info_schema = validate.Schema(
-    list,
-    validate.length(1),
-    validate.get(0),
-    dict
-)
-_amf3_array = validate.Schema(
-    validate.any(
-        validate.all(
-            {int: object},
-            validate.transform(lambda a: list(a.values())),
-        ),
-        list
-    )
-)
-_recorded_schema = validate.Schema({
-    validate.optional("stream"): validate.all(
-        _amf3_array,
-        [{
-            "name": validate.text,
-            "streams": validate.all(
-                _amf3_array,
-                [{
-                    "streamName": validate.text,
-                    "bitrate": float,
-                }],
-            ),
-            validate.optional("url"): validate.text,
-        }]
-    )
-})
-_stream_schema = validate.Schema(
-    validate.any({
-        "name": validate.text,
-        "url": validate.text,
-        "streams": validate.all(
-            _amf3_array,
-            [{
-                "chunkId": validate.any(int, float),
-                "chunkRange": {validate.text: validate.text},
-                "chunkTime": validate.any(int, float),
-                "offset": validate.any(int, float),
-                "offsetInMs": validate.any(int, float),
-                "streamName": validate.text,
-                validate.optional("bitrate"): validate.any(int, float),
-                validate.optional("height"): validate.any(int, float),
-                validate.optional("description"): validate.text,
-                validate.optional("isTranscoded"): bool
-            }],
+
+# TODO: use dataclasses for stream formats after dropping py36 to be able to subclass
+class StreamFormatVideo(NamedTuple):
+    contentType: str
+    sourceStreamVersion: int
+    initUrl: str
+    segmentUrl: str
+    bitrate: int
+    height: int
+
+
+class StreamFormatAudio(NamedTuple):
+    contentType: str
+    sourceStreamVersion: int
+    initUrl: str
+    segmentUrl: str
+    bitrate: int
+    language: str = ""
+
+
+class Segment(NamedTuple):
+    num: int
+    duration: int
+    available_at: datetime
+    hash: str
+    path: str
+
+    # the segment URLs depend on the CDN and the chosen stream format and its segment template string
+    def url(self, base: Optional[str], template: str) -> str:
+        return urljoin(
+            base or "",
+            f"{self.path}/{template.replace('%', str(self.num), 1).replace('%', self.hash, 1)}",
         )
-    },
-    {
-        "name": validate.text,
-        "varnishUrl": validate.text
+
+
+class UStreamTVWsClient(WebsocketClient):
+    API_URL = "wss://r{0}-1-{1}-{2}-ws-{3}.ums.services.video.ibm.com/1/ustream"
+    APP_ID = 3
+    APP_VERSION = 2
+
+    STREAM_OPENED_TIMEOUT = 6
+
+    _schema_cmd = validate.Schema({
+        "cmd": str,
+        "args": [{str: object}],
     })
-)
-_channel_schema = validate.Schema({
-    validate.optional("stream"): validate.any(
-        validate.all(
-            _amf3_array,
-            [_stream_schema],
+    _schema_stream_formats = validate.Schema({
+        "streams": [validate.any(
+            validate.all(
+                {
+                    "contentType": "video/mp4",
+                    "sourceStreamVersion": int,
+                    "initUrl": str,
+                    "segmentUrl": str,
+                    "bitrate": int,
+                    "height": int,
+                },
+                validate.transform(lambda obj: StreamFormatVideo(**obj)),
+            ),
+            validate.all(
+                {
+                    "contentType": "audio/mp4",
+                    "sourceStreamVersion": int,
+                    "initUrl": str,
+                    "segmentUrl": str,
+                    "bitrate": int,
+                    validate.optional("language"): str,
+                },
+                validate.transform(lambda obj: StreamFormatAudio(**obj)),
+            ),
+            object,
+        )],
+    })
+    _schema_stream_segments = validate.Schema({
+        "chunkId": int,
+        "chunkTime": int,
+        "contentAccess": validate.all(
+            {
+                "accessList": [{
+                    "data": {
+                        "path": str,
+                    },
+                }],
+            },
+            validate.get(("accessList", 0, "data", "path")),
         ),
-        "offline"
-    )
-})
+        "hashes": {validate.transform(int): str},
+    })
 
-Chunk = namedtuple("Chunk", "num url offset")
+    stream_cdn: Optional[str] = None
+    stream_formats_video: Optional[List[StreamFormatVideo]] = None
+    stream_formats_audio: Optional[List[StreamFormatAudio]] = None
+    stream_initial_id: Optional[int] = None
 
+    def __init__(
+        self,
+        session,
+        media_id,
+        application,
+        referrer=None,
+        cluster="live",
+        password=None,
+        app_id=APP_ID,
+        app_version=APP_VERSION,
+    ) -> None:
+        self.opened = Event()
+        self.ready = Event()
+        self.stream_error = None
+        # a list of deques subscribed by worker threads which independently need to read segments
+        self.stream_segments_subscribers: List[Deque[Segment]] = []
+        self.stream_segments_initial: Deque[Segment] = deque()
+        self.stream_segments_lock = RLock()
 
-if HAS_LIBRTMP:
-    from io import BytesIO
-    from time import time
+        self.media_id = media_id
+        self.application = application
+        self.referrer = referrer
+        self.cluster = cluster
+        self.password = password
+        self.app_id = app_id
+        self.app_version = app_version
 
-    from librtmp.rtmp import RTMPTimeoutError, PACKET_TYPE_INVOKE
-    from streamlink.packages.flashmedia.types import AMF0Value
+        super().__init__(session, self._get_url(), origin="https://www.ustream.tv")
 
-    def decode_amf(body):
-        def generator():
-            fd = BytesIO(body)
-            while True:
-                try:
-                    yield AMF0Value.read(fd)
-                except IOError:
-                    break
+    def _get_url(self):
+        return self.API_URL.format(randint(0, 0xffffff), self.media_id, self.application, self.cluster)
 
-        return list(generator())
+    def _set_error(self, error: Any):
+        self.stream_error = error
+        self.ready.set()
 
-    class FlashmediaRTMP(librtmp.RTMP):
-        """RTMP connection using python-flashmedia's AMF decoder.
+    def _set_ready(self):
+        if not self.ready.is_set() and self.stream_cdn and self.stream_initial_id is not None:
+            self.ready.set()
 
-        TODO: Move to python-librtmp instead.
-        """
-
-        def process_packets(self, transaction_id=None, invoked_method=None,
-                            timeout=None):
-            start = time()
-
-            while self.connected and transaction_id not in self._invoke_results:
-                if timeout and (time() - start) >= timeout:
-                    raise RTMPTimeoutError("Timeout")
-
-                packet = self.read_packet()
-                if packet.type == PACKET_TYPE_INVOKE:
-                    try:
-                        decoded = decode_amf(packet.body)
-                    except IOError:
-                        continue
-
-                    try:
-                        method, transaction_id_, obj = decoded[:3]
-                        args = decoded[3:]
-                    except ValueError:
-                        continue
-
-                    if method == "_result":
-                        if len(args) > 0:
-                            result = args[0]
-                        else:
-                            result = None
-
-                        self._invoke_results[transaction_id_] = result
-                    else:
-                        handler = self._invoke_handlers.get(method)
-                        if handler:
-                            res = handler(*args)
-                            if res is not None:
-                                self.call("_result", res,
-                                          transaction_id=transaction_id_)
-
-                        if method == invoked_method:
-                            self._invoke_args[invoked_method] = args
-                            break
-
-                    if transaction_id_ == 1.0:
-                        self._connect_result = packet
-                    else:
-                        self.handle_packet(packet)
-                else:
-                    self.handle_packet(packet)
-
-            if transaction_id:
-                result = self._invoke_results.pop(transaction_id, None)
-
-                return result
-
-            if invoked_method:
-                args = self._invoke_args.pop(invoked_method, None)
-
-                return args
-
-
-def create_ums_connection(app, media_id, page_url, password,
-                          exception=PluginError):
-    url = RTMP_URL.format(randint(0, 0xffffff), media_id)
-    params = {
-        "application": app,
-        "media": str(media_id),
-        "password": password
-    }
-    conn = FlashmediaRTMP(url,
-                          swfurl=SWF_URL,
-                          pageurl=page_url,
-                          connect_data=params)
-
-    try:
-        conn.connect()
-    except librtmp.RTMPError:
-        raise exception("Failed to connect to RTMP server")
-
-    return conn
-
-
-class UHSStreamWriter(SegmentedStreamWriter):
-    def __init__(self, *args, **kwargs):
-        SegmentedStreamWriter.__init__(self, *args, **kwargs)
-
-        self.concater = FLVTagConcat(flatten_timestamps=True,
-                                     sync_headers=True)
-
-    def fetch(self, chunk, retries=None):
-        if not retries or self.closed:
-            return
-
-        try:
-            params = {}
-            if chunk.offset:
-                params["start"] = chunk.offset
-
-            return http.get(chunk.url,
-                            timeout=self.timeout,
-                            params=params,
-                            exception=StreamError)
-        except StreamError as err:
-            self.logger.error("Failed to open chunk {0}: {1}", chunk.num, err)
-            return self.fetch(chunk, retries - 1)
-
-    def write(self, chunk, res, chunk_size=8192):
-        try:
-            for data in self.concater.iter_chunks(buf=res.content,
-                                                  skip_header=not chunk.offset):
-                self.reader.buffer.write(data)
-
-                if self.closed:
-                    break
+            if self.opened.wait(self.STREAM_OPENED_TIMEOUT):
+                log.debug("Stream opened, keeping websocket connection alive")
             else:
-                self.logger.debug("Download of chunk {0} complete", chunk.num)
-        except IOError as err:
-            self.logger.error("Failed to read chunk {0}: {1}", chunk.num, err)
+                log.info("Closing websocket connection")
+                self.ws.close()
 
+    def segments_subscribe(self) -> Deque[Segment]:
+        with self.stream_segments_lock:
+            # copy the initial segments deque (segments arrive early)
+            new_deque = self.stream_segments_initial.copy()
+            self.stream_segments_subscribers.append(new_deque)
 
-class UHSStreamWorker(SegmentedStreamWorker):
-    def __init__(self, *args, **kwargs):
-        SegmentedStreamWorker.__init__(self, *args, **kwargs)
+            return new_deque
 
-        self.chunk_ranges = {}
-        self.chunk_id = None
-        self.chunk_id_max = None
-        self.chunks = []
-        self.filename_format = ""
-        self.module_info_reload_time = 2
-        self.process_module_info()
-
-    def fetch_module_info(self):
-        self.logger.debug("Fetching module info")
-        conn = create_ums_connection("channel",
-                                     self.stream.channel_id,
-                                     self.stream.page_url,
-                                     self.stream.password,
-                                     exception=StreamError)
-
-        try:
-            result = conn.process_packets(invoked_method="moduleInfo",
-                                          timeout=10)
-        except (IOError, librtmp.RTMPError) as err:
-            raise StreamError("Failed to get module info: {0}".format(err))
-        finally:
-            conn.close()
-
-        result = _module_info_schema.validate(result)
-        return _channel_schema.validate(result, "module info")
-
-    def process_module_info(self):
-        if self.closed:
-            return
-
-        try:
-            result = self.fetch_module_info()
-        except PluginError as err:
-            self.logger.error("{0}", err)
-            return
-
-        providers = result.get("stream")
-        if not providers or providers == "offline":
-            self.logger.debug("Stream went offline")
-            self.close()
-            return
-
-        for provider in providers:
-            if provider.get("name") == self.stream.provider:
-                break
+    def _segments_append(self, segment: Segment):
+        # if there are no subscribers yet, add segment(s) to the initial deque
+        if not self.stream_segments_subscribers:
+            self.stream_segments_initial.append(segment)
         else:
+            for subscriber_deque in self.stream_segments_subscribers:
+                subscriber_deque.append(segment)
+
+    def on_open(self, wsapp):
+        args = {
+            "type": "viewer",
+            "appId": self.app_id,
+            "appVersion": self.app_version,
+            "rsid": f"{randint(0, 10_000_000_000):x}:{randint(0, 10_000_000_000):x}",
+            "rpin": f"_rpin.{randint(0, 1_000_000_000_000_000)}",
+            "referrer": self.referrer,
+            "clusterHost": "r%rnd%-1-%mediaId%-%mediaType%-%protocolPrefix%-%cluster%.ums.ustream.tv",
+            "media": self.media_id,
+            "application": self.application,
+        }
+        if self.password:
+            args["password"] = self.password
+
+        self.send_json({
+            "cmd": "connect",
+            "args": [args],
+        })
+
+    def on_message(self, wsapp, data: str):
+        try:
+            parsed = parse_json(data, schema=self._schema_cmd)
+        except PluginError:
+            log.error(f"Could not parse message: {data[:50]}")
             return
+
+        cmd: str = parsed["cmd"]
+        args: List[Dict] = parsed["args"]
+        log.trace(f"Received '{cmd}' command")  # type: ignore[attr-defined]
+        log.trace(f"{args!r}")  # type: ignore[attr-defined]
+
+        handlers = self._MESSAGE_HANDLERS.get(cmd)
+        if handlers is not None:
+            for arg in args:
+                for name, handler in handlers.items():
+                    argdata = arg.get(name)
+                    if argdata is not None:
+                        log.debug(f"Processing '{cmd}' - '{name}'")
+                        handler(self, argdata)
+
+    # noinspection PyMethodMayBeStatic
+    def _handle_warning(self, data: Dict):
+        log.warning(f"{data['code']}: {str(data['message'])[:50]}")
+
+    # noinspection PyUnusedLocal
+    def _handle_reject_nonexistent(self, *args):
+        self._set_error("This channel does not exist")
+
+    # noinspection PyUnusedLocal
+    def _handle_reject_geo_lock(self, *args):
+        self._set_error("This content is not available in your area")
+
+    def _handle_reject_cluster(self, arg: Dict):
+        self.cluster = arg["name"]
+        log.info(f"Switching cluster to: {self.cluster}")
+        self.reconnect(url=self._get_url())
+
+    def _handle_reject_referrer_lock(self, arg: Dict):
+        self.referrer = arg["redirectUrl"]
+        log.info(f"Updating referrer to: {self.referrer}")
+        self.reconnect(url=self._get_url())
+
+    def _handle_module_info_cdn_config(self, data: Dict):
+        self.stream_cdn = urlunparse((
+            data["protocol"],
+            data["data"][0]["data"][0]["sites"][0]["host"],
+            data["data"][0]["data"][0]["sites"][0]["path"],
+            "", "", "",
+        ))
+        self._set_ready()
+
+    def _handle_module_info_stream(self, data: Dict):
+        if data.get("contentAvailable") is False:
+            return self._set_error("This stream is currently offline")
+
+        mp4_segmented = data.get("streamFormats", {}).get("mp4/segmented")
+        if not mp4_segmented:
+            return
+
+        # parse the stream formats once
+        if self.stream_initial_id is None:
+            try:
+                formats = self._schema_stream_formats.validate(mp4_segmented)
+                formats = formats["streams"]
+            except PluginError as err:
+                return self._set_error(err)
+            self.stream_formats_video = list(filter(lambda f: type(f) is StreamFormatVideo, formats))
+            self.stream_formats_audio = list(filter(lambda f: type(f) is StreamFormatAudio, formats))
+
+        # parse segment duration and hashes, and queue new segments
+        try:
+            segmentdata: Dict = self._schema_stream_segments.validate(mp4_segmented)
+        except PluginError:
+            log.error("Failed parsing hashes")
+            return
+
+        current_id: int = segmentdata["chunkId"]
+        duration: int = segmentdata["chunkTime"]
+        path: str = segmentdata["contentAccess"]
+        hashes: Dict[int, str] = segmentdata["hashes"]
+
+        sorted_ids = sorted(hashes.keys())
+        count = len(sorted_ids)
+        if count == 0:
+            return
+
+        # initial segment ID (needed by the workers to filter queued segments)
+        if self.stream_initial_id is None:
+            self.stream_initial_id = current_id
+
+        current_time = datetime.now(timezone.utc)
+
+        # lock the stream segments deques for the worker threads
+        with self.stream_segments_lock:
+            # interpolate and extrapolate segments from the provided id->hash data
+            diff = 10 - sorted_ids[0] % 10  # if there's only one id->hash item, extrapolate until the next decimal
+            for idx, segment_id in enumerate(sorted_ids):
+                idx_next = idx + 1
+                if idx_next < count:
+                    # calculate the difference between IDs and use that to interpolate segment IDs
+                    # the last id->hash item will use the previous diff to extrapolate segment IDs
+                    diff = sorted_ids[idx_next] - segment_id
+                for num in range(segment_id, segment_id + diff):
+                    self._segments_append(Segment(
+                        num=num,
+                        duration=duration,
+                        available_at=current_time + timedelta(seconds=(num - current_id - 1) * duration / 1000),
+                        hash=hashes[segment_id],
+                        path=path,
+                    ))
+
+        self._set_ready()
+
+    # ----
+
+    _MESSAGE_HANDLERS: Dict[str, Dict[str, Callable[["UStreamTVWsClient", Any], None]]] = {
+        "warning": {
+            "code": _handle_warning,
+        },
+        "reject": {
+            "cluster": _handle_reject_cluster,
+            "referrerLock": _handle_reject_referrer_lock,
+            "nonexistent": _handle_reject_nonexistent,
+            "geoLock": _handle_reject_geo_lock,
+        },
+        "moduleInfo": {
+            "cdnConfig": _handle_module_info_cdn_config,
+            "stream": _handle_module_info_stream,
+        },
+    }
+
+
+class UStreamTVStreamWriter(SegmentedStreamWriter):
+    reader: "UStreamTVStreamReader"
+    stream: "UStreamTVStream"
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._has_init = False
+
+    def put(self, segment):
+        if self.closed:  # pragma: no cover
+            return
+
+        if segment is None:
+            self.queue(None, None)
+        else:
+            if not self._has_init:
+                self._has_init = True
+                self.queue(segment, self.executor.submit(self.fetch, segment, True))
+            self.queue(segment, self.executor.submit(self.fetch, segment, False))
+
+    # noinspection PyMethodOverriding
+    def fetch(self, segment: Segment, is_init: bool):  # type: ignore[override]
+        if self.closed:  # pragma: no cover
+            return
+
+        now = datetime.now(timezone.utc)
+        if segment.available_at > now:
+            time_to_wait = (segment.available_at - now).total_seconds()
+            log.debug(f"Waiting for {self.stream.kind} segment: {segment.num} ({time_to_wait:.01f}s)")
+            if not self.reader.worker.wait(time_to_wait):
+                return
 
         try:
-            stream = provider["streams"][self.stream.stream_index]
-        except IndexError:
-            self.logger.error("Stream index not in result")
+            return self.session.http.get(
+                segment.url(
+                    self.stream.wsclient.stream_cdn,
+                    self.stream.stream_format.initUrl if is_init else self.stream.stream_format.segmentUrl,
+                ),
+                timeout=self.timeout,
+                retries=self.retries,
+                exception=StreamError,
+            )
+        except StreamError as err:
+            log.error(f"Failed to fetch {self.stream.kind} segment {segment.num}: {err}")
+
+    def write(self, segment: Segment, res: Response, *data):
+        if self.closed:  # pragma: no cover
             return
+        try:
+            for chunk in res.iter_content(8192):
+                self.reader.buffer.write(chunk)
+            log.debug(f"Download of {self.stream.kind} segment {segment.num} complete")
+        except OSError as err:
+            log.error(f"Failed to read {self.stream.kind} segment {segment.num}: {err}")
 
-        filename_format = stream["streamName"].replace("%", "%s")
-        filename_format = urljoin(provider["url"], filename_format)
 
-        self.filename_format = filename_format
-        self.update_chunk_info(stream)
+class UStreamTVStreamWorker(SegmentedStreamWorker):
+    reader: "UStreamTVStreamReader"
+    writer: "UStreamTVStreamWriter"
+    stream: "UStreamTVStream"
 
-    def update_chunk_info(self, result):
-        chunk_range = result["chunkRange"]
-        if not chunk_range:
-            return
-
-        chunk_id = int(result["chunkId"])
-        chunk_offset = int(result["offset"])
-        chunk_range = dict(map(partial(map, int), chunk_range.items()))
-
-        self.chunk_ranges.update(chunk_range)
-        self.chunk_id_min = sorted(chunk_range)[0]
-        self.chunk_id_max = int(result["chunkId"])
-        self.chunks = [Chunk(i, self.format_chunk_url(i),
-                             not self.chunk_id and i == chunk_id and chunk_offset)
-                       for i in range(self.chunk_id_min, self.chunk_id_max + 1)]
-
-        if self.chunk_id is None and self.chunks:
-            self.chunk_id = chunk_id
-
-    def format_chunk_url(self, chunk_id):
-        chunk_hash = ""
-        for chunk_start in sorted(self.chunk_ranges):
-            if chunk_id >= chunk_start:
-                chunk_hash = self.chunk_ranges[chunk_start]
-
-        return self.filename_format % (chunk_id, chunk_hash)
-
-    def valid_chunk(self, chunk):
-        return self.chunk_id and chunk.num >= self.chunk_id
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.wsclient = self.stream.wsclient
+        self.segment_id = self.wsclient.stream_initial_id
+        self.queue = self.wsclient.segments_subscribe()
 
     def iter_segments(self):
+        duration = 5000
         while not self.closed:
-            for chunk in filter(self.valid_chunk, self.chunks):
-                self.logger.debug("Adding chunk {0} to queue", chunk.num)
-                yield chunk
+            try:
+                with self.wsclient.stream_segments_lock:
+                    segment = self.queue.popleft()
+                    duration = segment.duration
+            except IndexError:
+                # wait for new segments to be queued (half the last segment's duration in seconds)
+                if self.wait(duration / 1000 / 2):
+                    continue
 
-                # End of stream
-                if self.closed:
-                    return
+            if self.closed:
+                return
 
-                self.chunk_id = chunk.num + 1
+            if segment.num < self.segment_id:
+                continue
 
-            if self.wait(self.module_info_reload_time):
-                try:
-                    self.process_module_info()
-                except StreamError as err:
-                    self.logger.warning("Failed to process module info: {0}", err)
-
-
-class UHSStreamReader(SegmentedStreamReader):
-    __worker__ = UHSStreamWorker
-    __writer__ = UHSStreamWriter
-
-    def __init__(self, stream, *args, **kwargs):
-        self.logger = stream.session.logger.new_module("stream.uhs")
-
-        SegmentedStreamReader.__init__(self, stream, *args, **kwargs)
+            log.debug(f"Adding {self.stream.kind} segment {segment.num} to queue")
+            yield segment
+            self.segment_id = segment.num + 1
 
 
-class UHSStream(Stream):
-    __shortname__ = "uhs"
+class UStreamTVStreamReader(SegmentedStreamReader):
+    __worker__ = UStreamTVStreamWorker
+    __writer__ = UStreamTVStreamWriter
 
-    def __init__(self, session, channel_id, page_url, provider,
-                 stream_index, password=""):
-        Stream.__init__(self, session)
-
-        self.channel_id = channel_id
-        self.page_url = page_url
-        self.provider = provider
-        self.stream_index = stream_index
-        self.password = password
-
-    def __repr__(self):
-        return "<UHSStream({0!r}, {1!r}, {2!r}, {3!r}, {4!r})>".format(
-            self.channel_id, self.page_url, self.provider,
-            self.stream_index, self.password
-        )
-
-    def __json__(self):
-        json = Stream.__json__(self)
-        json.update({
-            "channel_id": self.channel_id,
-            "page_url": self.page_url,
-            "provider": self.provider,
-            "stream_index": self.stream_index,
-            "password": self.password
-        })
-        return json
+    stream: "UStreamTVStream"
+    worker: "UStreamTVStreamWorker"
+    writer: "UStreamTVStreamWriter"
 
     def open(self):
-        reader = UHSStreamReader(self)
+        self.stream.wsclient.opened.set()
+        super().open()
+
+    def close(self):
+        super().close()
+        self.stream.wsclient.close()
+
+
+class UStreamTVStream(Stream):
+    __shortname__ = "ustreamtv"
+
+    def __init__(
+        self,
+        session,
+        kind: str,
+        wsclient: UStreamTVWsClient,
+        stream_format: Union[StreamFormatVideo, StreamFormatAudio],
+    ):
+        super().__init__(session)
+        self.kind = kind
+        self.wsclient = wsclient
+        self.stream_format = stream_format
+
+    def open(self):
+        reader = UStreamTVStreamReader(self)
         reader.open()
 
         return reader
 
 
+@pluginmatcher(re.compile(r"""
+    https?://(?:(?:www\.)?ustream\.tv|video\.ibm\.com)
+    (?:
+        /combined-embed
+        /(?P<combined_channel_id>\d+)
+        (?:/video/(?P<combined_video_id>\d+))?
+        |
+        (?:(?:/embed/|/channel/(?:id/)?)(?P<channel_id>\d+))?
+        (?:(?:/embed)?/recorded/(?P<video_id>\d+))?
+    )
+""", re.VERBOSE))
+@pluginargument(
+    "password",
+    sensitive=True,
+    argument_name="ustream-password",
+    metavar="PASSWORD",
+    help="A password to access password protected UStream.tv channels.",
+)
 class UStreamTV(Plugin):
-    options = PluginOptions({
-        "password": ""
-    })
+    STREAM_READY_TIMEOUT = 15
 
-    @classmethod
-    def can_handle_url(cls, url):
-        return _url_re.match(url)
+    def _get_media_app(self):
+        video_id = self.match.group("video_id") or self.match.group("combined_video_id")
+        if video_id:
+            return video_id, "recorded"
 
-    @classmethod
-    def stream_weight(cls, stream):
-        match = re.match("mobile_(\w+)", stream)
-        if match:
-            weight, group = Plugin.stream_weight(match.group(1))
-            weight -= 1
-            group = "mobile_ustream"
-        elif stream == "recorded":
-            weight, group = 720, "ustream"
-        else:
-            weight, group = Plugin.stream_weight(stream)
-
-        return weight, group
-
-    def _get_channel_id(self):
-        res = http.get(self.url)
-        match = _channel_id_re.search(res.text)
-        if match:
-            return int(match.group(1))
-
-    def _get_hls_streams(self, channel_id, wait_for_transcode=False):
-        # HLS streams are created on demand, so we may have to wait
-        # for a transcode to be started.
-        attempts = wait_for_transcode and 10 or 1
-        playlist_url = HLS_PLAYLIST_URL.format(channel_id)
-        streams = {}
-        while attempts and not streams:
-            try:
-                streams = HLSStream.parse_variant_playlist(self.session,
-                                                           playlist_url,
-                                                           nameprefix="mobile_")
-            except IOError:
-                # Channel is probably offline
-                break
-
-            attempts -= 1
-            sleep(3)
-
-        return streams
-
-    def _create_rtmp_stream(self, cdn, stream_name):
-        parsed = urlparse(cdn)
-        params = {
-            "rtmp": cdn,
-            "app": parsed.path[1:],
-            "playpath": stream_name,
-            "pageUrl": self.url,
-            "swfUrl": SWF_URL,
-            "live": True
-        }
-
-        return RTMPStream(self.session, params)
-
-    def _get_module_info(self, app, media_id, password="", schema=None):
-        self.logger.debug("Waiting for moduleInfo invoke")
-        conn = create_ums_connection(app, media_id, self.url, password)
-
-        attempts = 3
-        while conn.connected and attempts:
-            try:
-                result = conn.process_packets(invoked_method="moduleInfo",
-                                              timeout=10)
-            except (IOError, librtmp.RTMPError) as err:
-                raise PluginError("Failed to get stream info: {0}".format(err))
-
-            try:
-                result = _module_info_schema.validate(result)
-                break
-            except PluginError:
-                attempts -= 1
-
-        conn.close()
-
-        if schema:
-            result = schema.validate(result)
-
-        return result
-
-    def _get_desktop_streams(self, channel_id):
-        password = self.options.get("password")
-        channel = self._get_module_info("channel", channel_id, password,
-                                        schema=_channel_schema)
-
-        if not isinstance(channel.get("stream"), list):
-            raise NoStreamsError(self.url)
-
-        streams = {}
-        for provider in channel["stream"]:
-            if provider["name"] == u"uhs_akamai":  # not heavily tested, but got a stream working
-                continue
-            provider_url = provider["url"]
-            provider_name = provider["name"]
-            for stream_index, stream_info in enumerate(provider["streams"]):
-                stream = None
-                stream_height = int(stream_info.get("height", 0))
-                stream_name = stream_info.get("description")
-                if not stream_name:
-                    if stream_height > 0:
-                        if not stream_info.get("isTranscoded"):
-                            stream_name = "{0}p+".format(stream_height)
-                        else:
-                            stream_name = "{0}p".format(stream_height)
-                    else:
-                        stream_name = "live"
-
-                if stream_name in streams:
-                    provider_name_clean = provider_name.replace("uhs_", "")
-                    stream_name += "_alt_{0}".format(provider_name_clean)
-
-                if provider_name.startswith("uhs_"):
-                    stream = UHSStream(self.session, channel_id,
-                                       self.url, provider_name,
-                                       stream_index, password)
-                elif provider_url.startswith("rtmp"):
-                        playpath = stream_info["streamName"]
-                        stream = self._create_rtmp_stream(provider_url,
-                                                          playpath)
-
-                if stream:
-                    streams[stream_name] = stream
-
-        return streams
-
-    def _get_live_streams(self, channel_id):
-        has_desktop_streams = False
-        if HAS_LIBRTMP:
-            try:
-                streams = self._get_desktop_streams(channel_id)
-                # TODO: Replace with "yield from" when dropping Python 2.
-                for stream in streams.items():
-                    has_desktop_streams = True
-                    yield stream
-            except PluginError as err:
-                self.logger.error("Unable to fetch desktop streams: {0}", err)
-            except NoStreamsError:
-                pass
-        else:
-            self.logger.warning(
-                "python-librtmp is not installed, but is needed to access "
-                "the desktop streams"
+        channel_id = self.match.group("channel_id") or self.match.group("combined_channel_id")
+        if not channel_id:
+            channel_id = self.session.http.get(
+                self.url,
+                headers={"User-Agent": useragents.CHROME},
+                schema=validate.Schema(
+                    validate.parse_html(),
+                    validate.xml_xpath_string(".//meta[@name='ustream:channel_id'][@content][1]/@content"),
+                ),
             )
 
-        try:
-            streams = self._get_hls_streams(channel_id,
-                                            wait_for_transcode=not has_desktop_streams)
-
-            # TODO: Replace with "yield from" when dropping Python 2.
-            for stream in streams.items():
-                yield stream
-        except PluginError as err:
-            self.logger.error("Unable to fetch mobile streams: {0}", err)
-        except NoStreamsError:
-            pass
-
-    def _get_recorded_streams(self, video_id):
-        if HAS_LIBRTMP:
-            recording = self._get_module_info("recorded", video_id,
-                                              schema=_recorded_schema)
-
-            if not isinstance(recording.get("stream"), list):
-                return
-
-            for provider in recording["stream"]:
-                base_url = provider.get("url")
-                for stream_info in provider["streams"]:
-                    bitrate = int(stream_info.get("bitrate", 0))
-                    stream_name = (bitrate > 0 and "{0}k".format(bitrate) or
-                                   "recorded")
-
-                    url = stream_info["streamName"]
-                    if base_url:
-                        url = base_url + url
-
-                    if url.startswith("http"):
-                        yield stream_name, HTTPStream(self.session, url)
-                    elif url.startswith("rtmp"):
-                        params = dict(rtmp=url, pageUrl=self.url)
-                        yield stream_name, RTMPStream(self.session, params)
-
-        else:
-            self.logger.warning(
-                "The proper API could not be used without python-librtmp "
-                "installed. Stream URL is not guaranteed to be valid"
-            )
-
-            url = RECORDED_URL.format(video_id)
-            random_hash = "{0:02x}{1:02x}".format(randint(0, 255),
-                                                  randint(0, 255))
-            params = dict(hash=random_hash)
-            stream = HTTPStream(self.session, url, params=params)
-            yield "recorded", stream
+        return channel_id, "channel"
 
     def _get_streams(self):
-        match = _url_re.match(self.url)
+        if not MuxedStream.is_usable(self.session):
+            return
 
-        video_id = match.group("video_id")
-        if video_id:
-            return self._get_recorded_streams(video_id)
+        media_id, application = self._get_media_app()
+        if not media_id:
+            return
 
-        channel_id = match.group("channel_id") or self._get_channel_id()
-        if channel_id:
-            return self._get_live_streams(channel_id)
+        wsclient = UStreamTVWsClient(
+            self.session,
+            media_id,
+            application,
+            referrer=self.url,
+            cluster="live",
+            password=self.get_option("password"),
+        )
+        log.debug(
+            "Connecting to UStream API: " + ", ".join([
+                f"media_id={media_id}",
+                f"application={application}",
+                f"referrer={self.url}",
+                f"cluster={'live'}",
+            ]),
+        )
+        wsclient.start()
+
+        log.debug(f"Waiting for stream data (for at most {self.STREAM_READY_TIMEOUT} seconds)...")
+        if (
+            not wsclient.ready.wait(self.STREAM_READY_TIMEOUT)
+            or not wsclient.is_alive()
+            or wsclient.stream_error
+        ):
+            log.error(wsclient.stream_error or "Waiting for stream data timed out.")
+            wsclient.close()
+            return
+
+        if not wsclient.stream_formats_audio:
+            for video in wsclient.stream_formats_video:
+                yield f"{video.height}p", UStreamTVStream(self.session, "video", wsclient, video)
+        else:
+            for video in wsclient.stream_formats_video:
+                for audio in wsclient.stream_formats_audio:
+                    yield f"{video.height}p+a{audio.bitrate}k", MuxedStream(
+                        self.session,
+                        UStreamTVStream(self.session, "video", wsclient, video),
+                        UStreamTVStream(self.session, "audio", wsclient, audio),
+                    )
+
 
 __plugin__ = UStreamTV
